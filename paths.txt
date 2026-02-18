@@ -7,9 +7,9 @@
 # Les lignes commençant par # sont ignorées
 #
 # Exemples typiques (fichiers sensibles souvent exposés par erreur) :
-# https://exemple.com/.env
-# https://exemple.com/.git/config
-# https://exemple.com/wp-config.php
-# https://exemple.com/admin
-# https://exemple.com/backup.zip
-# http://exemple.com/phpinfo.php
+ https://exemple.com/.env
+ https://exemple.com/.git/config
+ https://exemple.com/wp-config.php
+ https://exemple.com/admin
+ https://exemple.com/backup.zip
+ http://exemple.com/phpinfo.php
