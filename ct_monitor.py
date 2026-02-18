@@ -692,14 +692,13 @@ class PathMonitor:
         """
         Vérifie si un path sensible est accessible et retourne du vrai contenu.
 
-        Détections faux positifs (dans l'ordre) :
-          1. WAF / page de blocage classique
-          2. Page d'authentification (OAuth2, SSO, SAML, Azure AD, Keycloak...)
-          3. SPA catch-all (React/Vue/Angular qui retourne index.html pour tout)
-          4. Incohérence contenu/path (wp-config.php qui retourne du HTML, etc.)
+        Règle principale : un fichier sensible ne retourne JAMAIS du HTML.
+          - text/html dans Content-Type → rejeté immédiatement
+          - body qui commence par <!DOCTYPE ou <html → rejeté
+        Les détections WAF/auth/SPA restent en fallback pour les cas sans Content-Type.
         """
         MAX_CONTENT_SIZE = 5 * 1024 * 1024
-        parsed_path      = urlparse(url).path  # ex: /backup.sql, /actuator/env
+        parsed_path      = urlparse(url).path
 
         try:
             response      = requests.get(
@@ -708,17 +707,24 @@ class PathMonitor:
                 verify=False,
                 allow_redirects=True,
                 headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
-                stream=True  # stream=True ici est intentionnel : on lit en chunks pour respecter MAX_CONTENT_SIZE
+                stream=True
             )
             response_time = int(response.elapsed.total_seconds() * 1000)
 
             if response.status_code == 200:
-                # Vérifier Content-Type
                 content_type = response.headers.get('Content-Type', '').lower()
-                if (content_type
-                        and 'text/html'        not in content_type
-                        and 'application/json' not in content_type
-                        and 'text/plain'       not in content_type):
+
+                # RÈGLE PRINCIPALE : HTML = jamais un fichier sensible
+                if 'text/html' in content_type:
+                    response.close()
+                    tprint(f"[PATHS FP] {url} → Content-Type HTML rejeté")
+                    return (403, None, response_time, "HTML content-type: not a sensitive file")
+
+                # Rejeter les autres types non pertinents
+                if content_type and 'application/json' not in content_type \
+                        and 'text/plain' not in content_type \
+                        and 'application/octet-stream' not in content_type \
+                        and 'application/x-sh' not in content_type:
                     response.close()
                     return (403, None, response_time, f"Invalid Content-Type: {content_type}")
 
@@ -752,21 +758,13 @@ class PathMonitor:
                 if not content or len(content) <= 200:
                     return (403, None, response_time, f"Content too small ({len(content)} bytes)")
 
-                # --- DÉTECTION FAUX POSITIFS ---
+                # Fallback : si Content-Type absent/vague, vérifier que le body n'est pas du HTML
+                body_start = content[:200].lower().strip()
+                if body_start.startswith('<!doctype') or body_start.startswith('<html'):
+                    tprint(f"[PATHS FP] {url} → Body HTML détecté (pas de Content-Type)")
+                    return (403, None, response_time, "HTML body: not a sensitive file")
 
-                # 1. WAF classique
-                waf, reason = is_waf_block(response)
-                if waf:
-                    tprint(f"[PATHS FP] {url} → WAF/Auth: {reason}")
-                    return (403, None, response_time, f"WAF/Auth: {reason}")
-
-                # 2. SPA catch-all
-                is_catchall, catchall_reason = is_spa_catchall(content, parsed_path)
-                if is_catchall:
-                    tprint(f"[PATHS FP] {url} → SPA catch-all: {catchall_reason}")
-                    return (403, None, response_time, f"SPA catch-all: {catchall_reason}")
-
-                # 3. Cohérence contenu/path
+                # Cohérence contenu/path (fallback pour les cas ambigus)
                 is_coherent, coherence_reason = check_content_coherence(content, parsed_path)
                 if not is_coherent:
                     tprint(f"[PATHS FP] {url} → Contenu incohérent: {coherence_reason}")
