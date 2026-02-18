@@ -1,0 +1,6 @@
+# Fichier des domaines cibles à surveiller
+# Un domaine par ligne — les sous-domaines seront détectés automatiquement
+# Les lignes commençant par # sont ignorées
+
+# exemple.com
+# monsite.fr

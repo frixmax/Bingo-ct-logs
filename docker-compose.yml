@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  ct-monitor:
+    build: .
+    container_name: certstream-monitor
+    restart: unless-stopped
+    volumes:
+      # Volume persistant pour la base de données SQLite
+      - ct-data:/app/data
+      # Fichier domains.txt en lecture seule
+      - ./domains.txt:/app/domains.txt:ro
+    environment:
+      - TZ=UTC
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - monitor-net
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "ct_monitor.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  # Volume Docker persistant - survit aux redémarrages
+  ct-data:
+    driver: local
+
+networks:
+  monitor-net:
+    driver: bridge

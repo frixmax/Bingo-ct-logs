@@ -1,0 +1,15 @@
+# Fichier des paths spécifiques à surveiller
+# Vérifié toutes les 5 minutes — alerte Discord dans tous les cas :
+#   ✅ Si 200 OK  → le contenu de la page est envoyé à Discord
+#   ⚠️ Si non-200 → alerte "Path Check Failed" avec le status code
+#
+# Format : une URL complète par ligne (http:// ou https://)
+# Les lignes commençant par # sont ignorées
+#
+# Exemples typiques (fichiers sensibles souvent exposés par erreur) :
+# https://exemple.com/.env
+# https://exemple.com/.git/config
+# https://exemple.com/wp-config.php
+# https://exemple.com/admin
+# https://exemple.com/backup.zip
+# http://exemple.com/phpinfo.php
