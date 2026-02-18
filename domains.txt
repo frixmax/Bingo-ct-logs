@@ -1,6 +1,16 @@
-# Fichier des domaines cibles à surveiller
-# Un domaine par ligne — les sous-domaines seront détectés automatiquement
-# Les lignes commençant par # sont ignorées
-
-# exemple.com
-# monsite.fr
+nflxso.net
+nflxvideo.net
+nflxext.com
+nflximg.net
+vodafone.com
+vodacom.co.za
+vodafone.ro
+vodafone.it
+vodafone.cz
+vodafone.de
+vodafone.es
+tomtom.com
+tomtomgroup.com
+comcast.com
+openai.org
+ford.com
