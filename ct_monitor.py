@@ -357,14 +357,14 @@ class PathMonitor:
         if len(content) > 1900:
             preview += f"\n... (tronqué, taille totale: {len(content)} chars)"
         embed = {
-            "title":       "✅ Path Accessible - Contenu récupéré",
-            "description": f"**URL:** `{url}`\n\n**Contenu:**\n```\n{preview}\n```",
+            "title":       f"✅ Fichier sensible accessible",
+            "description": f"`{url}`\n\n```\n{preview}\n```",
             "color":       0x00ff00,
             "fields": [
                 {"name": "Taille",  "value": f"{len(content)} bytes", "inline": True},
                 {"name": "Status",  "value": "200 OK",                "inline": True},
             ],
-            "footer":    {"text": "CT Monitor - Path Content"},
+            "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
         }
         self._send_embed(embed)
@@ -372,34 +372,26 @@ class PathMonitor:
 
     def send_retrieve_failed_alert(self, url, error_msg):
         embed = {
-            "title":       "⚠️ Retrieve Failed",
-            "description": f"**URL:** `{url}`\n\n**Erreur:** {error_msg}",
-            "color":       0xffaa00,
-            "fields": [
-                {"name": "Status", "value": "200 OK",                   "inline": True},
-                {"name": "Issue",  "value": "Récupération du contenu échouée", "inline": True},
-            ],
-            "footer":    {"text": "CT Monitor - Retrieve Failed"},
+            "title":       "Path - contenu vide",
+            "description": f"`{url}`\nStatus 200 mais contenu vide — {error_msg}",
+            "color":       0x888888,
+            "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
         }
         self._send_embed(embed)
-        tprint(f"[PATHS ALERT] ⚠️ Retrieve failed: {url} — {error_msg}")
+        tprint(f"[PATHS] Retrieve failed: {url} — {error_msg}")
 
     def send_check_failed_alert(self, url, status_code, response_time):
         status_str = str(status_code) if status_code else "timeout"
         embed = {
-            "title":       "⚠️ Path Check Failed",
-            "description": f"**URL:** `{url}`\n\n**Status:** {status_str}",
-            "color":       0xffaa00,
-            "fields": [
-                {"name": "Status Code",    "value": status_str,                                  "inline": True},
-                {"name": "Response Time",  "value": f"{response_time}ms" if response_time else "N/A", "inline": True},
-            ],
-            "footer":    {"text": "CT Monitor - Path Check Failed"},
+            "title":       "Path inaccessible",
+            "description": f"`{url}` — {status_str}",
+            "color":       0x888888,
+            "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
         }
         self._send_embed(embed)
-        tprint(f"[PATHS ALERT] ⚠️ Check failed: {url} [{status_str}]")
+        tprint(f"[PATHS] Check failed: {url} [{status_str}]")
 
     def check_all(self):
         if not self.paths:
@@ -547,25 +539,25 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             description += f"\n**{base}**\n"
             if data['accessible']:
                 total_accessible += len(data['accessible'])
-                description += "  🟢 En ligne (2xx/3xx):\n"
+                description += "  En ligne:\n"
                 for domain, status in data['accessible']:
                     description += f"    `{domain}` [{status}]\n"
             if data['unreachable']:
                 total_unreachable += len(data['unreachable'])
-                description += "  🔴 Hors ligne (4xx/5xx/timeout):\n"
+                description += "  Hors ligne:\n"
                 for domain, status in data['unreachable']:
                     description += f"    `{domain}` [{status if status else 'timeout'}]\n"
 
         embed = {
-            "title":       f"🚨 {len(matched_domains_with_status)} certificats découverts",
+            "title":       f"Nouveaux certificats — {len(matched_domains_with_status)} domaine(s)",
             "description": description,
-            "color":       0xff8800,
+            "color":       0x5865f2,
             "fields": [
-                {"name": "🟢 En ligne",          "value": str(total_accessible),  "inline": True},
-                {"name": "🔴 Hors ligne",         "value": str(total_unreachable), "inline": True},
-                {"name": "Source",                "value": log_name,               "inline": True},
+                {"name": "En ligne",   "value": str(total_accessible),  "inline": True},
+                {"name": "Hors ligne", "value": str(total_unreachable), "inline": True},
+                {"name": "Source",     "value": log_name,               "inline": True},
             ],
-            "footer":    {"text": "CT Monitor - Status Check Results"},
+            "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
         }
 
@@ -585,10 +577,10 @@ def send_now_accessible_alert(domain):
     """Alerte quand un domaine précédemment inaccessible répond 200."""
     try:
         embed = {
-            "title":       "🟢 Domaine maintenant accessible!",
-            "description": f"`{domain}` est maintenant **online** (200 OK)",
+            "title":       f"🟢 {domain}",
+            "description": "Ce domaine est maintenant accessible (200 OK)",
             "color":       0x00ff00,
-            "footer":      {"text": "CT Monitor - Status Change"},
+            "footer":      {"text": "CT Monitor"},
             "timestamp":   datetime.utcnow().isoformat()
         }
         if DISCORD_WEBHOOK:
