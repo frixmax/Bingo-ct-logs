@@ -188,6 +188,10 @@ class CertificateDatabase:
             self._local.conn.execute('PRAGMA synchronous=NORMAL')
         return self._local.conn
 
+    def get_conn(self):
+        """Méthode publique pour accès externe à la connexion du thread courant."""
+        return self._get_conn()
+
     def init_db(self):
         conn   = self._get_conn()
         cursor = conn.cursor()
@@ -684,7 +688,7 @@ class PathMonitor:
                 verify=False,
                 allow_redirects=True,
                 headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
-                stream=True
+                stream=True  # stream=True ici est intentionnel : on lit en chunks pour respecter MAX_CONTENT_SIZE
             )
             response_time = int(response.elapsed.total_seconds() * 1000)
 
@@ -695,20 +699,34 @@ class PathMonitor:
                         and 'text/html'        not in content_type
                         and 'application/json' not in content_type
                         and 'text/plain'       not in content_type):
+                    response.close()
                     return (403, None, response_time, f"Invalid Content-Type: {content_type}")
 
                 # Vérifier taille annoncée
                 try:
                     size = int(response.headers.get('Content-Length', '0'))
                     if size > MAX_CONTENT_SIZE:
+                        response.close()
                         return (403, None, response_time, f"Content too large ({size} bytes)")
                 except Exception:
                     pass
 
-                # Lire le body
+                # Lire le body en chunks avec limite stricte
                 try:
-                    content = response.text[:MAX_CONTENT_SIZE]
+                    chunks = []
+                    total  = 0
+                    for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
+                        if isinstance(chunk, bytes):
+                            chunk = chunk.decode('utf-8', errors='replace')
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total >= MAX_CONTENT_SIZE:
+                            tprint(f"[PATHS WARN] {url} → Body tronqué à {MAX_CONTENT_SIZE} bytes")
+                            break
+                    content = ''.join(chunks)
+                    response.close()
                 except Exception as e:
+                    response.close()
                     return (None, None, response_time, f"Error reading body: {str(e)[:50]}")
 
                 if not content or len(content) <= 200:
@@ -853,51 +871,6 @@ if not targets:
     tprint("[ERREUR] Aucun domaine à surveiller — arrêt.")
     exit(1)
 
-# ==================== CHARGEMENT SUBDOMAINS MANUELS ====================
-def load_subdomains_from_file():
-    loaded = duplicates = 0
-    if not os.path.exists(SUBDOMAINS_FILE):
-        tprint(f"[INFO] {SUBDOMAINS_FILE} n'existe pas (optionnel)")
-        return loaded, duplicates
-    try:
-        with open(SUBDOMAINS_FILE, 'r') as f:
-            subdomains = [l.strip().lower() for l in f if l.strip() and not l.startswith('#')]
-
-        tprint(f"[LOAD] {len(subdomains)} sous-domaines dans {SUBDOMAINS_FILE}")
-
-        for entry in subdomains:
-            subdomain, port = parse_subdomain_entry(entry)
-            db_key          = entry
-            base_domain     = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
-
-            if db.subdomain_exists(db_key):
-                duplicates += 1
-                tprint(f"[LOAD] ⏭️  Déjà en DB: {db_key}")
-                continue
-
-            tprint(f"[LOAD] 🔍 Check initial: {subdomain} ...")
-            status_code, response_time = check_domain(subdomain)
-
-            if port:
-                port_open, port_time = check_port(subdomain, port)
-                tprint(f"[LOAD] 🔌 {subdomain}:{port} — port {'ouvert' if port_open else 'fermé'}")
-
-            db.add_subdomain_from_file(db_key, base_domain, status_code)
-            loaded += 1
-
-            status_str = str(status_code) if status_code else "timeout"
-            if status_code == 200:
-                tprint(f"[LOAD] ✅ {db_key} [{status_str}] — en ligne, surveillé")
-            else:
-                tprint(f"[LOAD] 🔴 {db_key} [{status_str}] — hors ligne, ajouté au monitoring")
-
-        tprint(f"[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB")
-        return loaded, duplicates
-
-    except Exception as e:
-        tprint(f"[ERROR] Chargement subdomains: {e}")
-        return 0, 0
-
 # ==================== PERSISTANCE POSITIONS ====================
 def load_positions():
     try:
@@ -909,11 +882,21 @@ def load_positions():
     return {}
 
 def save_positions():
+    # Ecriture atomique : on ecrit dans un fichier tmp puis on renomme
+    # → si le container redemarre pendant l'ecriture, le fichier original reste intact
+    tmp_file = POSITIONS_FILE + '.tmp'
     try:
-        with open(POSITIONS_FILE, 'w') as f:
-            json.dump(stats['positions'], f, indent=2)
+        with stats_lock:
+            positions_copy = dict(stats['positions'])
+        with open(tmp_file, 'w') as f:
+            json.dump(positions_copy, f, indent=2)
+        os.replace(tmp_file, POSITIONS_FILE)  # atomique sur tous les OS POSIX
     except Exception as e:
         tprint(f"[WARN] Sauvegarde positions: {e}")
+        try:
+            os.remove(tmp_file)
+        except Exception:
+            pass
 
 stats['positions'] = load_positions()
 
@@ -935,7 +918,7 @@ def check_domain(domain):
                 allow_redirects=True,
                 verify=False,
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-                stream=True
+                stream=False  # stream=False : on lit directement, requests gère la limite via timeout
             )
             elapsed = int((time.time() - start) * 1000)
 
@@ -994,6 +977,53 @@ def parse_subdomain_entry(entry):
         except ValueError:
             return (entry, None)
     return (entry, None)
+
+# ==================== CHARGEMENT SUBDOMAINS MANUELS ====================
+def load_subdomains_from_file():
+    # Appelée après check_domain(), check_port() et parse_subdomain_entry()
+    # pour éviter NameError au runtime
+    loaded = duplicates = 0
+    if not os.path.exists(SUBDOMAINS_FILE):
+        tprint(f"[INFO] {SUBDOMAINS_FILE} n'existe pas (optionnel)")
+        return loaded, duplicates
+    try:
+        with open(SUBDOMAINS_FILE, 'r') as f:
+            subdomains = [l.strip().lower() for l in f if l.strip() and not l.startswith('#')]
+
+        tprint(f"[LOAD] {len(subdomains)} sous-domaines dans {SUBDOMAINS_FILE}")
+
+        for entry in subdomains:
+            subdomain, port = parse_subdomain_entry(entry)
+            db_key          = entry
+            base_domain     = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
+
+            if db.subdomain_exists(db_key):
+                duplicates += 1
+                tprint(f"[LOAD] ⏭️  Déjà en DB: {db_key}")
+                continue
+
+            tprint(f"[LOAD] 🔍 Check initial: {subdomain} ...")
+            status_code, response_time = check_domain(subdomain)
+
+            if port:
+                port_open, port_time = check_port(subdomain, port)
+                tprint(f"[LOAD] 🔌 {subdomain}:{port} — port {'ouvert' if port_open else 'fermé'}")
+
+            db.add_subdomain_from_file(db_key, base_domain, status_code)
+            loaded += 1
+
+            status_str = str(status_code) if status_code else "timeout"
+            if status_code == 200:
+                tprint(f"[LOAD] ✅ {db_key} [{status_str}] — en ligne, surveillé")
+            else:
+                tprint(f"[LOAD] 🔴 {db_key} [{status_str}] — hors ligne, ajouté au monitoring")
+
+        tprint(f"[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB")
+        return loaded, duplicates
+
+    except Exception as e:
+        tprint(f"[ERROR] Chargement subdomains: {e}")
+        return 0, 0
 
 # ==================== DISCORD ALERTS ====================
 def send_discovery_alert(matched_domains_with_status, log_name):
@@ -1194,9 +1224,14 @@ def cron_recheck_unreachable():
                         tprint(f"[CRON] 🔴 {domain} [{status_str}]{port_status} — toujours hors ligne")
                         still_down += 1
 
-                tprint(f"[CRON] Résumé: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
+            tprint(f"[CRON] Résumé: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
 
-            path_monitor.check_all()
+            # path_monitor.check_all() est lancé dans un thread séparé pour ne pas
+            # bloquer le prochain cycle de recheck si le scan de paths prend des heures
+            paths_thread = threading.Thread(target=path_monitor.check_all, daemon=True, name="PathScan")
+            paths_thread.start()
+            tprint(f"[CRON] Scan paths lancé en arrière-plan (thread {paths_thread.name})")
+
             tprint(f"[CRON] Prochain recheck dans {UNREACHABLE_RECHECK_INTERVAL}s")
             time.sleep(UNREACHABLE_RECHECK_INTERVAL)
 
@@ -1216,7 +1251,8 @@ def monitor_log(log_config):
         try:
             response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
             tree_size = response.json()['tree_size']
-            stats['positions'][log_name] = max(0, tree_size - 1000)
+            with stats_lock:
+                stats['positions'][log_name] = max(0, tree_size - 1000)
             tprint(f"[INIT] {log_name}: position initiale {stats['positions'][log_name]:,}")
         except Exception:
             return 0
@@ -1227,7 +1263,8 @@ def monitor_log(log_config):
     except Exception:
         return 0
 
-    current_pos = stats['positions'][log_name]
+    with stats_lock:
+        current_pos = stats['positions'][log_name]
     if current_pos >= tree_size:
         return 0
 
@@ -1292,7 +1329,8 @@ def monitor_log(log_config):
                     db.add_domain(domain, base, status_code, log_name)
 
         current_pos                  = end_pos
-        stats['positions'][log_name] = current_pos
+        with stats_lock:
+            stats['positions'][log_name] = current_pos
         batches_done                += 1
         with stats_lock:
             stats['batches_processed'] += 1
@@ -1319,7 +1357,7 @@ def monitor_all_logs():
 # ==================== NETTOYAGE DB ====================
 def cleanup_db():
     try:
-        conn   = db._get_conn()
+        conn   = db.get_conn()
         cursor = conn.cursor()
 
         cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
@@ -1350,7 +1388,7 @@ def cleanup_db():
 def dump_db():
     tprint("[DUMP] Envoi du contenu de la DB sur Discord...")
     try:
-        conn    = db._get_conn()
+        conn    = db.get_conn()
         cursor  = conn.cursor()
         summary = db.stats_summary()
 
@@ -1461,6 +1499,11 @@ while True:
 
         monitor_all_logs()
         save_positions()
+
+        # Nettoyage du cache de notifications expirees (TTL 6h)
+        cleared = notif_cache.clear_expired()
+        if cleared > 0:
+            tprint(f"[CYCLE #{cycle}] Cache notifs: {cleared} entree(s) expiree(s) supprimee(s)")
 
         cycle_duration = int(time.time() - cycle_start)
 
