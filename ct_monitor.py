@@ -1060,6 +1060,42 @@ def cleanup_db():
     except Exception as e:
         tprint(f"[DB CLEANUP ERROR] {e}")
 
+# ==================== DUMP DB (variable DUMP_DB=1) ====================
+def dump_db():
+    tprint("[DUMP] ================================================")
+    tprint("[DUMP] Contenu de la base de données")
+    tprint("[DUMP] ================================================")
+    try:
+        conn   = db._get_conn()
+        cursor = conn.cursor()
+
+        # Stats globales
+        summary = db.stats_summary()
+        tprint(f"[DUMP] Total: {summary['total']} domaines | {db.size_mb()} MB")
+        tprint(f"[DUMP] timeout: {summary['timeout']} | 4xx: {summary['4xx']} | 5xx: {summary['5xx']}")
+        tprint("[DUMP] ------------------------------------------------")
+
+        # Tous les domaines
+        cursor.execute('''
+            SELECT domain, base_domain, status_code, log_source, first_seen, last_check
+            FROM unreachable_domains
+            ORDER BY last_check DESC
+        ''')
+        rows = cursor.fetchall()
+        for domain, base, status, source, first_seen, last_check in rows:
+            status_str = str(status) if status else "timeout"
+            tprint(f"[DUMP] {domain} [{status_str}] | base={base} | source={source} | vu={first_seen} | recheck={last_check}")
+
+        tprint("[DUMP] ================================================")
+        tprint("[DUMP] Fin du dump — retire DUMP_DB=1 pour relancer le monitoring")
+    except Exception as e:
+        tprint(f"[DUMP ERROR] {e}")
+
+# Si DUMP_DB=1 → afficher la DB et quitter
+if os.environ.get('DUMP_DB', '0') == '1':
+    dump_db()
+    exit(0)
+
 # ==================== DÉMARRAGE ====================
 tprint("[START] ================================================")
 tprint(f"[START] CT Monitor démarré")
