@@ -447,9 +447,15 @@ class PathMonitor:
                     return (403, None, response_time, f"WAF: {reason}")
                 
                 content = response.text
-                if content:
+                
+                # Validation: le contenu doit avoir une taille minimale (> 200 bytes)
+                # pour éviter les pages vides ou de redirection
+                if content and len(content) > 200:
                     return (200, content, response_time, None)
-                return (200, None, response_time, "Content is empty")
+                elif content:
+                    return (403, None, response_time, "Content too small (< 200 bytes)")
+                else:
+                    return (403, None, response_time, "Content is empty")
             return (response.status_code, None, response_time, None)
         except requests.exceptions.Timeout:
             return (None, None, HTTP_CHECK_TIMEOUT * 1000, "Timeout")
@@ -697,6 +703,13 @@ def check_domain(domain):
     Retourne (status_code_effectif, response_time_ms).
     Si 200 mais WAF détecté → retourne (403, elapsed) pour signaler l'inaccessibilité réelle.
     """
+    # Multiple User-Agents pour éviter les blocages
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    ]
+    
     for protocol in ['https', 'http']:
         try:
             start    = time.time()
@@ -705,10 +718,15 @@ def check_domain(domain):
                 timeout=HTTP_CHECK_TIMEOUT,
                 allow_redirects=True,
                 verify=False,
-                headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
+                headers={'User-Agent': user_agents[hash(domain) % len(user_agents)]},
                 stream=True  # ne télécharge pas tout le body immédiatement
             )
             elapsed = int((time.time() - start) * 1000)
+
+            # Vérifier si une redirection s'est produite
+            requested_url = f"{protocol}://{domain}"
+            if response.url != requested_url and response.url.lower() != f"{protocol}://{domain.lower()}/":
+                tprint(f"[REDIRECT] {domain} → {response.url}")
 
             # Si 200 : vérifier si c'est un vrai 200 ou un WAF
             if response.status_code == 200:
