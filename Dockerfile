@@ -9,8 +9,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir requests cryptography urllib3
 
+# Script principal
 COPY ct_monitor.py .
+
+# Fichiers de configuration — copiés dans l'image au build
+# Pour modifier : éditer dans le repo et pousser → Railway rebuild automatiquement
 COPY domains.txt .
+COPY subdomains.txt .
+COPY paths.txt .
 
 RUN mkdir -p /app/data
 
