@@ -450,12 +450,10 @@ def load_subdomains_from_file():
         tprint(f"[LOAD] {len(subdomains)} sous-domaines dans {SUBDOMAINS_FILE}")
 
         for subdomain in subdomains:
-            base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), None)
-
-            if not base_domain:
-                tprint(f"[LOAD] ❌ Domaine cible introuvable pour: {subdomain}")
-                skipped += 1
-                continue
+            # subdomains.txt est indépendant de domains.txt
+            # Accepte n'importe quel domaine sans vérification
+            # base_domain = le domaine lui-même s'il ne matche aucune cible
+            base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
 
             if db.subdomain_exists(subdomain):
                 duplicates += 1
