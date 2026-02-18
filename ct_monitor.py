@@ -441,6 +441,11 @@ class PathMonitor:
                                          headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'})
             response_time = int(response.elapsed.total_seconds() * 1000)
             if response.status_code == 200:
+                # Vérifier si c'est un WAF block
+                waf, reason = is_waf_block(response)
+                if waf:
+                    return (403, None, response_time, f"WAF: {reason}")
+                
                 content = response.text
                 if content:
                     return (200, content, response_time, None)
