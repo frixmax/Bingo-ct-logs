@@ -254,7 +254,7 @@ class CertificateDatabase:
             return False
 
     def add_domain(self, domain, base_domain, status_code, log_source):
-        is_online = 1 if (status_code and 200 <= status_code < 400) else 0
+        is_online = 1 if (status_code and (200 <= status_code < 500 or status_code == 431)) else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -278,7 +278,7 @@ class CertificateDatabase:
             return False
 
     def add_subdomain_from_file(self, domain, base_domain, status_code=None):
-        is_online = 1 if (status_code and 200 <= status_code < 400) else 0
+        is_online = 1 if (status_code and (200 <= status_code < 500 or status_code == 431)) else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -319,7 +319,7 @@ class CertificateDatabase:
             return []
 
     def update_check(self, domain, status_code, response_time_ms):
-        is_online = 1 if (status_code and 200 <= status_code < 400) else 0
+        is_online = 1 if (status_code and (200 <= status_code < 500 or status_code == 431)) else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -477,33 +477,57 @@ class PathMonitor:
         tprint(f"[PATHS ALERT] Fichier sensible: {url}")
 
     def check_domain(self, domain):
-        # Verifie tous les paths sur un domaine donne
         host, port = parse_subdomain_entry(domain)
-        found = 0
+        found      = 0
+        errors     = 0
+        checked    = 0
         for path in self.paths:
             for protocol in ['https', 'http']:
                 url = f"{protocol}://{host}{path}"
                 status_code, content, response_time, error = self.check_path(url)
+                checked += 1
                 if status_code == 200 and content:
+                    tprint(f"[PATHS] ✅ TROUVE: {url} [{len(content)} bytes]")
                     self.send_content_alert(url, content)
                     found += 1
-                    break  # pas besoin de tester http si https ok
-        return found
+                    break
+                elif error:
+                    errors += 1
+                    break  # timeout/erreur reseau sur ce path, passe au suivant
+                else:
+                    break  # 4xx/5xx = path n existe pas, passe au suivant
+        return found, checked, errors
 
     def check_all(self):
-        # Recupere tous les domaines en DB et verifie les paths sur chacun
         all_domains = db.get_all_domains()
         if not all_domains:
+            tprint("[PATHS CRON] Aucun domaine en DB")
             return
-        tprint(f"[PATHS CRON] Scan de {len(self.paths)} paths sur {len(all_domains)} domaines...")
-        total_found = 0
-        for domain in all_domains:
-            found = self.check_domain(domain)
-            total_found += found
+
+        total_requests = len(self.paths) * len(all_domains)
+        tprint(f"[PATHS CRON] Debut scan — {len(all_domains)} domaines x {len(self.paths)} paths = {total_requests} requetes max")
+
+        total_found  = 0
+        total_checked = 0
+        total_errors  = 0
+        start = time.time()
+
+        for i, domain in enumerate(all_domains, 1):
+            found, checked, errors = self.check_domain(domain)
+            total_found   += found
+            total_checked += checked
+            total_errors  += errors
+            # Log de progression tous les 10 domaines
+            if i % 10 == 0:
+                tprint(f"[PATHS CRON] Progression: {i}/{len(all_domains)} domaines scannés...")
+
+        elapsed = int(time.time() - start)
+        tprint(f"[PATHS CRON] Scan terminé en {elapsed}s")
+        tprint(f"[PATHS CRON] Requetes: {total_checked} effectuées | {total_errors} erreurs réseau")
         if total_found > 0:
-            tprint(f"[PATHS CRON] {total_found} fichier(s) sensible(s) trouve(s)!")
+            tprint(f"[PATHS CRON] {total_found} fichier(s) sensible(s) trouvé(s) !")
         else:
-            tprint(f"[PATHS CRON] Aucun fichier sensible trouve")
+            tprint(f"[PATHS CRON] Aucun fichier sensible trouvé")
 path_monitor = PathMonitor(PATHS_FILE)
 
 # ==================== CHARGEMENT DOMAINES CIBLES ====================
@@ -563,7 +587,7 @@ def load_subdomains_from_file():
             loaded += 1
 
             status_str = str(status_code) if status_code else "timeout"
-            if status_code and 200 <= status_code < 400:
+            if status_code and (200 <= status_code < 500 or status_code == 431):
                 tprint(f"[LOAD] ✅ {db_key} [{status_str}] — en ligne, surveillé")
             else:
                 tprint(f"[LOAD] 🔴 {db_key} [{status_str}] — hors ligne, ajouté au monitoring")
@@ -737,7 +761,7 @@ def send_discovery_alert(matched_domains_with_status, log_name):
                 by_base.setdefault(base, {'accessible': [], 'unreachable': []})
                 # Accessible = 200 ou redirection 3xx
                 # Inaccessible = 4xx, 5xx, timeout (None)
-                if status_code and 200 <= status_code < 400:
+                if status_code and (200 <= status_code < 500 or status_code == 431):
                     by_base[base]['accessible'].append((domain, status_code))
                 else:
                     by_base[base]['unreachable'].append((domain, status_code))
@@ -918,7 +942,7 @@ def cron_recheck_unreachable():
 
                     status_str = str(status_code) if status_code else "timeout"
 
-                    if status_code and 200 <= status_code < 400:
+                    if status_code and (200 <= status_code < 500 or status_code == 431):
                         tprint(f"[CRON] ✅ {domain} [{status_str}]{port_status} — redevenu accessible!")
                         send_now_accessible_alert(domain)
                         db.mark_online(domain, status_code)
