@@ -273,6 +273,27 @@ class CertificateDatabase:
         except Exception as e:
             print(f"[DB ERROR] mark_notified {domain}: {e}")
 
+    def remove_domain(self, domain):
+        """Supprime un domaine de la DB quand il est redevenu accessible."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM unreachable_domains WHERE domain = ?', (domain,))
+            conn.commit()
+            print(f"[DB] 🗑️  {domain} retiré du monitoring (redevenu accessible)")
+        except Exception as e:
+            print(f"[DB ERROR] remove_domain {domain}: {e}")
+
+    def count(self):
+        """Retourne le nombre de domaines en monitoring."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM unreachable_domains')
+            return cursor.fetchone()[0]
+        except Exception as e:
+            return 0
+
 db = CertificateDatabase(DATABASE_FILE)
 
 # ==================== PATHS MONITOR ====================
@@ -650,30 +671,51 @@ def parse_certificate(entry):
 def cron_recheck_unreachable():
     """
     Toutes les 5 minutes :
-      - Revérifie les domaines inaccessibles en DB
-      - Alerte Discord si un domaine devient 200
+      - Revérifie tous les domaines en DB
+      - Si redevenu accessible : alerte Discord + suppression de la DB
+      - Si toujours inaccessible : update last_check et log
       - Vérifie les paths spécifiques
     """
     print("[CRON] Thread recheck démarré")
     while True:
         try:
-            unreachable = db.get_unreachable(limit=50)
-            if unreachable:
-                print(f"[CRON] Recheck de {len(unreachable)} domaines...")
-                for domain, base_domain, last_check in unreachable:
+            domains = db.get_unreachable(limit=100)
+            total   = db.count()
+
+            print(f"[CRON] ---- Recheck démarré — {total} domaine(s) en monitoring ----")
+
+            if not domains:
+                print("[CRON] Aucun domaine à recheck")
+            else:
+                back_online = 0
+                still_down  = 0
+
+                for domain, base_domain, last_check in domains:
                     status_code, response_time = check_domain(domain)
-                    db.update_check(domain, status_code, response_time)
-                    # Alerte si retour en ligne (200 ou redirection 3xx)
+                    status_str = str(status_code) if status_code else "timeout"
+
                     if status_code and 200 <= status_code < 400:
+                        # Redevenu accessible → alerte + suppression DB
+                        print(f"[CRON] ✅ {domain} [{status_str}] — redevenu accessible!")
                         send_now_accessible_alert(domain)
-                        db.mark_notified(domain)
-                        print(f"[CRON] ✅ {domain} est maintenant accessible! [{status_code}]")
+                        db.remove_domain(domain)
+                        back_online += 1
+                    else:
+                        # Toujours inaccessible → update last_check
+                        db.update_check(domain, status_code, response_time)
+                        print(f"[CRON] 🔴 {domain} [{status_str}] — toujours hors ligne")
+                        still_down += 1
+
+                print(f"[CRON] Résumé: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
 
             path_monitor.check_all()
+            print(f"[CRON] Prochain recheck dans {UNREACHABLE_RECHECK_INTERVAL}s")
             time.sleep(UNREACHABLE_RECHECK_INTERVAL)
 
         except Exception as e:
             print(f"[CRON ERROR] {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(60)
 
 # ==================== CT MONITORING ====================
