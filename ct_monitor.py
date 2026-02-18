@@ -19,6 +19,7 @@ import sqlite3
 import hashlib
 import urllib3
 from datetime import datetime
+from urllib.parse import urlparse
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -749,8 +750,7 @@ def check_domain(domain):
                 allow_redirects=True,
                 verify=False,
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-                stream=True,  # ne télécharge pas tout le body immédiatement
-                allow_redirects=True
+                stream=True
             )
             elapsed = int((time.time() - start) * 1000)
 
