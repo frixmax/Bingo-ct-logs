@@ -645,12 +645,23 @@ WAF_BLOCK_BODY_SIGNATURES = [
     'forbidden by policy',
     'security policy violation',
     'robots" content="noindex',
+    # Pages d'erreur personnalisées
+    'pagina de eroare',  # Erreur en roumain
+    'página de error',   # Erreur en espagnol
+    'page d\'erreur',    # Erreur en français
+    'error page',        # Erreur en anglais
+    'eroare',            # Erreur en roumain
+    'NotFoundException',
+    'not found',
+    'endpoint not found',
+    'resource not found',
 ]
 
 def is_waf_block(response):
-    # Detecte uniquement les pages de BLOCAGE WAF
+    # Detecte uniquement les pages de BLOCAGE WAF et erreurs
     # Un site servi par Cloudflare avec vrai contenu → False
     # Une page de blocage Cloudflare/Incapsula → True
+    # Une page d'erreur 404 déguisée en 200 → True
     headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
 
@@ -663,7 +674,7 @@ def is_waf_block(response):
 
         for sig in WAF_BLOCK_BODY_SIGNATURES:
             if sig in body:
-                return (True, f"WAF block: '{sig}'")
+                return (True, f"WAF/Error: '{sig}'")
 
         # Cloudflare JS challenge : page courte avec challenge/captcha
         if is_short and 'cloudflare' in body and ('challenge' in body or 'captcha' in body):
