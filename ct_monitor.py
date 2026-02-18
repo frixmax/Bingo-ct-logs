@@ -144,6 +144,39 @@ class LRUCache:
 
 seen_certificates = LRUCache(CACHE_MAX_SIZE)
 
+# ==================== CACHE NOTIFICATIONS ====================
+class NotificationCache:
+    # Cache TTL pour eviter de notifier plusieurs fois le meme domaine
+    # dans une courte periode. Thread-safe.
+    def __init__(self, ttl_seconds=3600):
+        self.cache = {}
+        self.ttl   = ttl_seconds
+        self.lock  = threading.Lock()
+
+    def already_notified(self, domain):
+        with self.lock:
+            if domain in self.cache:
+                if time.time() - self.cache[domain] < self.ttl:
+                    return True
+                del self.cache[domain]
+            return False
+
+    def mark(self, domain):
+        with self.lock:
+            self.cache[domain] = time.time()
+
+    def clear_expired(self):
+        with self.lock:
+            now     = time.time()
+            expired = [d for d, t in self.cache.items() if now - t >= self.ttl]
+            for d in expired:
+                del self.cache[d]
+            return len(expired)
+
+# TTL 6h : un domaine ne sera pas renotifie dans Discord pendant 6 heures
+NOTIFICATION_TTL = 6 * 3600
+notif_cache = NotificationCache(ttl_seconds=NOTIFICATION_TTL)
+
 # ==================== DATABASE ====================
 class CertificateDatabase:
     """
@@ -621,13 +654,29 @@ def check_domain(domain):
 
 # ==================== DISCORD ALERTS ====================
 def send_discovery_alert(matched_domains_with_status, log_name):
-    """Envoie un embed Discord groupé par domaine de base."""
+    """Envoie un embed Discord groupe par domaine de base."""
     try:
         if not matched_domains_with_status:
             return
 
-        by_base = {}
+        # Filtrer les domaines deja notifies recemment (cache TTL 6h)
+        filtered = []
+        skipped  = 0
         for domain, status_code in matched_domains_with_status:
+            if notif_cache.already_notified(domain):
+                skipped += 1
+            else:
+                filtered.append((domain, status_code))
+                notif_cache.mark(domain)
+
+        if skipped > 0:
+            tprint(f"[DISCORD] {skipped} domaine(s) ignores - deja notifies recemment")
+
+        if not filtered:
+            return
+
+        by_base = {}
+        for domain, status_code in filtered:
             base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
             if base:
                 by_base.setdefault(base, {'accessible': [], 'unreachable': []})
@@ -655,7 +704,7 @@ def send_discovery_alert(matched_domains_with_status, log_name):
                     description += f"    `{domain}` [{status if status else 'timeout'}]\n"
 
         embed = {
-            "title":       f"Nouveaux certificats — {len(matched_domains_with_status)} domaine(s)",
+            "title":       f"Nouveaux certificats — {len(filtered)} domaine(s)",
             "description": description,
             "color":       0x5865f2,
             "fields": [
