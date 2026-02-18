@@ -5,16 +5,13 @@ services:
     build: .
     container_name: certstream-monitor
     restart: unless-stopped
+    ports:
+      - "10000:10000"
     volumes:
-      # Persistance de la base de données SQLite et des positions CT
-      - ct-data:/app/data
-      # Optionnel : Montez vos fichiers de config ici pour les éditer sans rebuild
-      # - ./domains.txt:/app/domains.txt:ro
-      # - ./subdomains.txt:/app/subdomains.txt:ro
+      - ./domains.txt:/app/domains.txt:ro
     environment:
       - TZ=UTC
-      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
-      - DISCORD_SECRET=${DISCORD_SECRET} # Optionnel
+      - PORT=10000
     logging:
       driver: "json-file"
       options:
@@ -22,17 +19,6 @@ services:
         max-file: "3"
     networks:
       - monitor-net
-    healthcheck:
-      # Vérifie que le script tourne (pgrep) ET que le heartbeat est récent
-      test: ["CMD-SHELL", "pgrep -f 'ct_monitor.py' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
-volumes:
-  ct-data:
-    driver: local
 
 networks:
   monitor-net:
