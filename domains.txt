@@ -19,3 +19,5 @@ facebook.com
 whatsapp.com
 instagram.com
 messenger.com
+x.com
+twitter.com
