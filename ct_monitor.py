@@ -715,13 +715,27 @@ WAF_BLOCK_BODY_SIGNATURES = [
     'not found',
     'endpoint not found',
     'resource not found',
+    # Pages de login / authentification
+    'sign in to your account',  # Azure AD
+    'login.microsoftonline.com',  # Microsoft login
+    'aadcdn.msftauth.net',  # Azure auth CDN
+    'aadcdn.msauth.net',  # Azure auth CDN
+    'ConvergedSignIn',  # Azure AD sign in page
+    'oauth20_authorize',  # OAuth redirect
+    'login.live.com',  # Microsoft Live login
+    'accounts.google.com',  # Google login
+    'accounts.google',  # Google login
+    'github.com/login',  # GitHub login
+    'login required',  # Generic login
+    'authentication required',  # Generic auth
 ]
 
 def is_waf_block(response):
-    # Detecte uniquement les pages de BLOCAGE WAF et erreurs
+    # Detecte uniquement les pages de BLOCAGE WAF, erreurs et pages de login/auth
     # Un site servi par Cloudflare avec vrai contenu → False
     # Une page de blocage Cloudflare/Incapsula → True
     # Une page d'erreur 404 déguisée en 200 → True
+    # Une page de login Azure/Google/GitHub → True
     headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
 
@@ -734,7 +748,7 @@ def is_waf_block(response):
 
         for sig in WAF_BLOCK_BODY_SIGNATURES:
             if sig in body:
-                return (True, f"WAF/Error: '{sig}'")
+                return (True, f"Blocked/Auth: '{sig}'")
 
         # Cloudflare JS challenge : page courte avec challenge/captcha
         if is_short and 'cloudflare' in body and ('challenge' in body or 'captcha' in body):
