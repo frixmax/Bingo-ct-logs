@@ -523,23 +523,98 @@ def save_positions():
 stats['positions'] = load_positions()
 
 # ==================== HTTP CHECKER ====================
+# Signatures WAF détectées dans les headers de réponse
+WAF_HEADERS = {
+    'server': [
+        'cloudflare', 'sucuri', 'incapsula', 'imperva', 'akamai',
+        'barracuda', 'f5 big-ip', 'fortiweb', 'modsecurity',
+        'aws', 'fastly', 'radware', 'reblaze',
+    ],
+    'x-sucuri-id':       None,
+    'x-sucuri-cache':    None,
+    'x-iinfo':           None,   # Incapsula
+    'x-cdn':             None,
+    'x-protected-by':    None,
+    'x-waf-event-info':  None,
+    'x-fw-protect':      None,   # Fortinet
+    'x-amz-cf-id':       None,   # CloudFront
+    'cf-ray':            None,   # Cloudflare
+    'x-akamai-transformed': None,
+}
+
+# Signatures WAF dans le body HTML
+WAF_BODY_SIGNATURES = [
+    'cloudflare', 'sucuri webiste firewall', 'incapsula incident',
+    'access denied', 'blocked by', 'security check',
+    'ray id', 'cf-wrapper', '__cf_chl',
+    'fortigate', 'barracuda networks', 'imperva',
+    'akamai reference', 'you have been blocked',
+    'this request has been blocked', 'mod_security',
+    'request rejected', 'webknight',
+]
+
+def is_waf_response(response):
+    """
+    Détecte si une réponse 200 vient d'un WAF et non du vrai serveur.
+    Retourne (True, raison) si WAF détecté, (False, None) sinon.
+    """
+    headers = {k.lower(): v.lower() for k, v in response.headers.items()}
+
+    # Vérifier les headers WAF
+    for header, keywords in WAF_HEADERS.items():
+        if header in headers:
+            if keywords is None:
+                # La présence du header suffit
+                return (True, f"WAF header: {header}")
+            for kw in keywords:
+                if kw in headers[header]:
+                    return (True, f"WAF header: {header}={headers[header]}")
+
+    # Vérifier le body uniquement si contenu HTML court (page d'erreur)
+    content_type = headers.get('content-type', '')
+    if 'text/html' in content_type:
+        try:
+            body = response.text.lower()
+            # Body trop court = probablement une page d'erreur WAF
+            if len(body) < 5000:
+                for sig in WAF_BODY_SIGNATURES:
+                    if sig in body:
+                        return (True, f"WAF body: '{sig}'")
+        except Exception:
+            pass
+
+    return (False, None)
+
 def check_domain(domain):
     """
     Vérifie HTTP/HTTPS avec suivi des redirections.
-    Retourne (status_code_final, response_time_ms).
-    Un 301/302 n'est plus traité comme inaccessible.
+    Fait un GET (pas HEAD) pour pouvoir analyser le body et détecter les WAF.
+    Retourne (status_code_effectif, response_time_ms).
+    Si 200 mais WAF détecté → retourne (403, elapsed) pour signaler l'inaccessibilité réelle.
     """
     for protocol in ['https', 'http']:
         try:
             start    = time.time()
-            response = requests.head(
+            response = requests.get(
                 f"{protocol}://{domain}",
                 timeout=HTTP_CHECK_TIMEOUT,
-                allow_redirects=True,   # ← CORRIGÉ: suit les redirections
-                verify=False
+                allow_redirects=True,
+                verify=False,
+                headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
+                stream=True  # ne télécharge pas tout le body immédiatement
             )
             elapsed = int((time.time() - start) * 1000)
+
+            # Si 200 : vérifier si c'est un vrai 200 ou un WAF
+            if response.status_code == 200:
+                waf, reason = is_waf_response(response)
+                if waf:
+                    tprint(f"[WAF] {domain} → 200 bloqué par WAF ({reason})")
+                    return (403, elapsed)  # traité comme inaccessible
+                return (200, elapsed)
+
             return (response.status_code, elapsed)
+
         except Exception:
             continue
     return (None, None)
