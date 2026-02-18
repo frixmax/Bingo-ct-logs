@@ -505,29 +505,35 @@ def load_subdomains_from_file():
 
         tprint(f"[LOAD] {len(subdomains)} sous-domaines dans {SUBDOMAINS_FILE}")
 
-        for subdomain in subdomains:
-            # subdomains.txt est indépendant de domains.txt
-            # Accepte n'importe quel domaine sans vérification
-            # base_domain = le domaine lui-même s'il ne matche aucune cible
+        for entry in subdomains:
+            subdomain, port = parse_subdomain_entry(entry)
+            db_key = entry  # clé en DB = entrée brute (ex: sub.domain.com:8443)
+
             base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
 
-            if db.subdomain_exists(subdomain):
+            if db.subdomain_exists(db_key):
                 duplicates += 1
-                tprint(f"[LOAD] ⏭️  Déjà en DB: {subdomain}")
+                tprint(f"[LOAD] ⏭️  Déjà en DB: {db_key}")
                 continue
 
-            # Check HTTP immédiat pour connaitre l'état réel dès le départ
+            # Check HTTP standard
             tprint(f"[LOAD] 🔍 Check initial: {subdomain} ...")
             status_code, response_time = check_domain(subdomain)
 
-            db.add_subdomain_from_file(subdomain, base_domain, status_code)
+            # Check port supplémentaire si spécifié
+            if port:
+                port_open, port_time = check_port(subdomain, port)
+                port_str = f"port {port}: {'ouvert' if port_open else 'fermé'}"
+                tprint(f"[LOAD] 🔌 {subdomain}:{port} — {port_str}")
+
+            db.add_subdomain_from_file(db_key, base_domain, status_code)
             loaded += 1
 
             status_str = str(status_code) if status_code else "timeout"
             if status_code and 200 <= status_code < 400:
-                tprint(f"[LOAD] ✅ {subdomain} [{status_str}] — en ligne, surveillé")
+                tprint(f"[LOAD] ✅ {db_key} [{status_str}] — en ligne, surveillé")
             else:
-                tprint(f"[LOAD] 🔴 {subdomain} [{status_str}] — hors ligne, ajouté au monitoring")
+                tprint(f"[LOAD] 🔴 {db_key} [{status_str}] — hors ligne, ajouté au monitoring")
 
         tprint(f"[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB | {skipped} ignorés")
         return loaded, duplicates
@@ -557,66 +563,52 @@ stats['positions'] = load_positions()
 
 # ==================== HTTP CHECKER ====================
 # Signatures WAF détectées dans les headers de réponse
-WAF_HEADERS = {
-    'server': [
-        'cloudflare', 'sucuri', 'incapsula', 'imperva', 'akamai',
-        'barracuda', 'f5 big-ip', 'fortiweb', 'modsecurity',
-        'aws', 'fastly', 'radware', 'reblaze',
-    ],
-    'x-sucuri-id':       None,
-    'x-sucuri-cache':    None,
-    'x-iinfo':           None,   # Incapsula
-    'x-cdn':             None,
-    'x-protected-by':    None,
-    'x-waf-event-info':  None,
-    'x-fw-protect':      None,   # Fortinet
-    'x-amz-cf-id':       None,   # CloudFront
-    'cf-ray':            None,   # Cloudflare
-    'x-akamai-transformed': None,
-}
-
-# Signatures WAF dans le body HTML
-WAF_BODY_SIGNATURES = [
-    'cloudflare', 'sucuri webiste firewall', 'incapsula incident',
-    'access denied', 'blocked by', 'security check',
-    'ray id', 'cf-wrapper', '__cf_chl',
-    'fortigate', 'barracuda networks', 'imperva',
-    'akamai reference', 'you have been blocked',
-    'this request has been blocked', 'mod_security',
-    'request rejected', 'webknight',
+# Signatures de BLOCAGE WAF dans le body
+# On detecte uniquement les pages d erreur/blocage, pas la simple presence d un WAF
+WAF_BLOCK_BODY_SIGNATURES = [
+    'you have been blocked',
+    'this request has been blocked',
+    'access denied',
+    'your access to this site has been limited',
+    'sorry, you have been blocked',
+    '__cf_chl_opt',
+    'cf-please-wait',
+    'checking your browser before accessing',
+    'sucuri website firewall - access denied',
+    'incapsula incident id',
+    'mod_security',
+    'request rejected',
+    'forbidden by policy',
+    'security policy violation',
 ]
 
-def is_waf_response(response):
-    """
-    Détecte si une réponse 200 vient d'un WAF et non du vrai serveur.
-    Retourne (True, raison) si WAF détecté, (False, None) sinon.
-    """
-    headers = {k.lower(): v.lower() for k, v in response.headers.items()}
-
-    # Vérifier les headers WAF
-    for header, keywords in WAF_HEADERS.items():
-        if header in headers:
-            if keywords is None:
-                # La présence du header suffit
-                return (True, f"WAF header: {header}")
-            for kw in keywords:
-                if kw in headers[header]:
-                    return (True, f"WAF header: {header}={headers[header]}")
-
-    # Vérifier le body uniquement si contenu HTML court (page d'erreur)
+def is_waf_block(response):
+    # Detecte uniquement les pages de BLOCAGE WAF
+    # Un site servi par Cloudflare avec vrai contenu → False
+    # Une page de blocage Cloudflare → True
+    headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
-    if 'text/html' in content_type:
-        try:
-            body = response.text.lower()
-            # Body trop court = probablement une page d'erreur WAF
-            if len(body) < 5000:
-                for sig in WAF_BODY_SIGNATURES:
-                    if sig in body:
-                        return (True, f"WAF body: '{sig}'")
-        except Exception:
-            pass
+
+    if 'text/html' not in content_type:
+        return (False, None)
+
+    try:
+        body     = response.text[:8000].lower()
+        is_short = len(body) < 2000
+
+        for sig in WAF_BLOCK_BODY_SIGNATURES:
+            if sig in body:
+                return (True, f"WAF block: '{sig}'")
+
+        # Cloudflare JS challenge : page courte avec challenge/captcha
+        if is_short and 'cloudflare' in body and ('challenge' in body or 'captcha' in body):
+            return (True, "WAF block: cloudflare challenge")
+
+    except Exception:
+        pass
 
     return (False, None)
+
 
 def check_domain(domain):
     """
@@ -640,7 +632,7 @@ def check_domain(domain):
 
             # Si 200 : vérifier si c'est un vrai 200 ou un WAF
             if response.status_code == 200:
-                waf, reason = is_waf_response(response)
+                waf, reason = is_waf_block(response)
                 if waf:
                     tprint(f"[WAF] {domain} → 200 bloqué par WAF ({reason})")
                     return (403, elapsed)  # traité comme inaccessible
@@ -651,6 +643,36 @@ def check_domain(domain):
         except Exception:
             continue
     return (None, None)
+
+def check_port(host, port, timeout=10):
+    """Vérifie si un port TCP est ouvert. Retourne (open, response_time_ms)."""
+    import socket
+    try:
+        start  = time.time()
+        sock   = socket.create_connection((host, port), timeout=timeout)
+        elapsed = int((time.time() - start) * 1000)
+        sock.close()
+        return (True, elapsed)
+    except Exception:
+        return (False, None)
+
+def parse_subdomain_entry(entry):
+    """
+    Parse une entrée de subdomains.txt.
+    Formats acceptés:
+      - sous.domain.com          → domain=sous.domain.com, port=None
+      - sous.domain.com:8443     → domain=sous.domain.com, port=8443
+    Retourne (domain, port_or_None).
+    """
+    entry = entry.strip().lower()
+    if ':' in entry:
+        parts = entry.rsplit(':', 1)
+        try:
+            port = int(parts[1])
+            return (parts[0], port)
+        except ValueError:
+            return (entry, None)
+    return (entry, None)
 
 # ==================== DISCORD ALERTS ====================
 def send_discovery_alert(matched_domains_with_status, log_name):
@@ -845,19 +867,32 @@ def cron_recheck_unreachable():
                 still_down  = 0
 
                 for domain, base_domain, last_check in domains:
-                    status_code, response_time = check_domain(domain)
+                    # Extraire host et port si format host:port
+                    host, port = parse_subdomain_entry(domain)
+
+                    # Check HTTP standard sur le host
+                    status_code, response_time = check_domain(host)
+
+                    # Check port additionnel si spécifié
+                    port_status = ""
+                    if port:
+                        port_open, port_time = check_port(host, port)
+                        port_status = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
+                        if port_open and (not status_code or status_code >= 400):
+                            # Port ouvert mais HTTP pas ok → considérer accessible
+                            status_code = 200
+                            tprint(f"[CRON] 🔌 {domain} — port {port} ouvert")
+
                     status_str = str(status_code) if status_code else "timeout"
 
                     if status_code and 200 <= status_code < 400:
-                        # Redevenu accessible → alerte + suppression DB
-                        tprint(f"[CRON] ✅ {domain} [{status_str}] — redevenu accessible!")
+                        tprint(f"[CRON] ✅ {domain} [{status_str}]{port_status} — redevenu accessible!")
                         send_now_accessible_alert(domain)
                         db.remove_domain(domain)
                         back_online += 1
                     else:
-                        # Toujours inaccessible → update last_check
                         db.update_check(domain, status_code, response_time)
-                        tprint(f"[CRON] 🔴 {domain} [{status_str}] — toujours hors ligne")
+                        tprint(f"[CRON] 🔴 {domain} [{status_str}]{port_status} — toujours hors ligne")
                         still_down += 1
 
                 tprint(f"[CRON] Résumé: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
