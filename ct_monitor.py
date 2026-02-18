@@ -302,6 +302,37 @@ class CertificateDatabase:
         except Exception as e:
             return 0
 
+    def size_mb(self):
+        """Retourne la taille de la DB en MB."""
+        try:
+            size = os.path.getsize(self.db_path)
+            return round(size / 1024 / 1024, 2)
+        except Exception:
+            return 0
+
+    def stats_summary(self):
+        """Retourne un résumé: total domaines, dont combien par status."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status_code IS NULL THEN 1 ELSE 0 END) as timeouts,
+                    SUM(CASE WHEN status_code >= 400 AND status_code < 500 THEN 1 ELSE 0 END) as errors_4xx,
+                    SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END) as errors_5xx
+                FROM unreachable_domains
+            ''')
+            row = cursor.fetchone()
+            return {
+                'total':    row[0],
+                'timeout':  row[1],
+                '4xx':      row[2],
+                '5xx':      row[3],
+            }
+        except Exception:
+            return {'total': 0, 'timeout': 0, '4xx': 0, '5xx': 0}
+
 db = CertificateDatabase(DATABASE_FILE)
 
 # ==================== PATHS MONITOR ====================
@@ -881,6 +912,9 @@ tprint("[START] ================================================")
 # Nettoyage DB au démarrage (wildcards, orphelins)
 tprint("[STARTUP] Etape 1/3 — Nettoyage base de données...")
 cleanup_db()
+_db_stats = db.stats_summary()
+tprint(f"[STARTUP] DB: {_db_stats['total']} domaine(s) en monitoring | {db.size_mb()} MB")
+tprint(f"[STARTUP] DB detail: {_db_stats['timeout']} timeout | {_db_stats['4xx']} 4xx | {_db_stats['5xx']} 5xx")
 
 # Chargement subdomains manuels
 tprint(f"[STARTUP] Etape 2/3 — Chargement {SUBDOMAINS_FILE}...")
@@ -889,6 +923,8 @@ if not os.path.exists(SUBDOMAINS_FILE):
 else:
     loaded_count, duplicate_count = load_subdomains_from_file()
     tprint(f"[STARTUP] Subdomains: {loaded_count} nouveau(x) ajouté(s), {duplicate_count} déjà en DB")
+    _db_stats = db.stats_summary()
+    tprint(f"[STARTUP] DB après chargement: {_db_stats['total']} domaine(s) en monitoring | {db.size_mb()} MB")
 
 # Démarrage thread cron
 tprint("[STARTUP] Etape 3/3 — Démarrage thread cron recheck...")
@@ -917,13 +953,15 @@ while True:
 
         cycle_duration = int(time.time() - cycle_start)
 
+        _db_stats = db.stats_summary()
         tprint(f"[CYCLE #{cycle}] Terminé en {cycle_duration}s")
         tprint(f"[CYCLE #{cycle}] Certificats analysés : {stats['certificats_analysés']:,}")
         tprint(f"[CYCLE #{cycle}] Matches trouvés      : {stats['matches_trouvés']:,}")
-        tprint(f"[CYCLE #{cycle}] Alertes envoyées     : {stats['alertes_envoyées']:,}")
         tprint(f"[CYCLE #{cycle}] HTTP checks          : {stats['http_checks']:,}")
+        tprint(f"[CYCLE #{cycle}] Alertes envoyées     : {stats['alertes_envoyées']:,}")
         tprint(f"[CYCLE #{cycle}] Duplicates évités    : {stats['duplicates_évités']:,}")
-        tprint(f"[CYCLE #{cycle}] Parse errors         : {stats['parse_errors']:,}")
+        tprint(f"[CYCLE #{cycle}] DB monitoring        : {_db_stats['total']} domaine(s) | {db.size_mb()} MB")
+        tprint(f"[CYCLE #{cycle}] DB detail            : {_db_stats['timeout']} timeout | {_db_stats['4xx']} 4xx | {_db_stats['5xx']} 5xx")
         tprint(f"[CYCLE #{cycle}] Prochain cycle dans {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 
