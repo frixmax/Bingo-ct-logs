@@ -8,8 +8,10 @@ services:
     volumes:
       # Volume persistant pour la base de données SQLite
       - ct-data:/app/data
-      # Fichier domains.txt en lecture seule
+      # Fichiers de configuration en lecture seule
       - ./domains.txt:/app/domains.txt:ro
+      - ./subdomains.txt:/app/data/subdomains.txt:ro
+      - ./paths.txt:/app/data/paths.txt:ro
     environment:
       - TZ=UTC
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
