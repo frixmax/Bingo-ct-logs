@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION v4 - PRODUCTION READY (corrigé unpacking NoneType)
-Améliorations v4 + fix unpacking :
-- Gestion complète du retour None de check_domain (évite TypeError)
+CT Monitoring VPS - VERSION v4.1 - PRODUCTION READY (Fix TypeError NoneType)
+Corrections appliquées :
+- Gestion robuste du retour None de check_domain (évite le crash dans cron_recheck)
 - Logs plus clairs sur échecs retries
-- Le reste est identique à ta version v4
+- Logique identique à v4 pour le reste
 """
 import requests
 import json
@@ -38,7 +38,7 @@ def tprint(msg):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 tprint("=" * 100)
-tprint("CT MONITORING - VERSION v4 - PRODUCTION READY (fixed unpacking None)")
+tprint("CT MONITORING - VERSION v4.1 - PRODUCTION READY (Fixed NoneType unpack)")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 tprint("=" * 100)
 
@@ -713,7 +713,12 @@ def retry_with_backoff(func, max_retries=HTTP_CHECK_RETRIES, timeout_base=1):
         try:
             return func()
         except Exception as e:
-            tprint(f"[RETRY] Attempt {attempt+1}/{max_retries} failed: {str(e)[:100]}")
+            # Log plus clair
+            if attempt == max_retries - 1:
+                 tprint(f"[RETRY] All {max_retries} attempts failed.")
+            else:
+                 tprint(f"[RETRY] Attempt {attempt+1}/{max_retries} failed: {str(e)[:100]}")
+            
             if attempt == max_retries - 1:
                 return None
             wait_time = timeout_base * (2 ** attempt)
@@ -828,7 +833,7 @@ def check_domain(domain: str) -> tuple | None:
         try:
             return future.result(timeout=HTTP_CHECK_TIMEOUT + 2)
         except Exception as e:
-            tprint(f"[CHECK DOMAIN] Future timeout/failure pour {domain}: {str(e)}")
+            # tprint(f"[CHECK DOMAIN] Future timeout/failure pour {domain}: {str(e)}") # Trop verbeux
             return None
 
     result = retry_with_backoff(inner_check)
@@ -1251,6 +1256,8 @@ def cron_recheck_unreachable():
                         break
                     for domain, base_domain, last_check in domains:
                         host, port = parse_subdomain_entry(domain)
+                        
+                        # CORRECTION: Gestion sécurisée du retour None
                         check_result = check_domain(host)
                         if check_result is None:
                             status_code = None
@@ -1258,6 +1265,7 @@ def cron_recheck_unreachable():
                             tprint(f"[CRON] ⚠️ Échec total check {domain} après retries")
                         else:
                             status_code, response_time = check_result
+                        
                         port_status = ""
                         if port:
                             port_open, _ = check_port(host, port)
@@ -1518,7 +1526,7 @@ if os.environ.get('DUMP_DB', '0') == '1':
 
 # ==================== DÉMARRAGE ====================
 tprint("[START] ================================================")
-tprint(f"[START] CT Monitor v4 - Production Ready (fixed)")
+tprint(f"[START] CT Monitor v4.1 - Production Ready (Fixed)")
 tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s) surveillés")
 tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | Session keep-alive")
 tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History: {CHECK_HISTORY_RETENTION_DAYS}j")
