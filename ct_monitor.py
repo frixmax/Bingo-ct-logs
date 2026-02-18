@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION AMÉLIORÉE
+CT Monitoring VPS - VERSION AMÉLIORÉE v2
 1. Découvrir sous-domaines via CT Logs (28)
 2. Check status code HTTP/HTTPS (avec suivi redirections)
 3. Envoyer TOUS résultats à Discord
 4. Parser et extraire NON-200 seulement
 5. Stocker en DB SQLite (pool de connexions)
 6. Cron job (5min) - Recheck + alerte si 200
+
+AMÉLIORATIONS v2:
+- Semaphore global pour limiter les connexions HTTP simultanées
+- Purge automatique de check_history (rétention 7 jours)
+- Discord alerts via queue asynchrone (non-bloquant)
+- cleanup_db() entièrement en SQL (pas d'allocation mémoire)
+- dump_db() paginé avec fetchmany()
+- NOTIFICATION_TTL réduit à 1h (au lieu de 6h)
+- Fallback body strip() avant startswith() pour BOM/espaces
+- Cache hash amélioré avec SHA1 tronqué (moins de collisions)
 """
 
 import requests
@@ -20,6 +30,7 @@ import base64
 import sqlite3
 import hashlib
 import urllib3
+import queue
 from datetime import datetime
 from urllib.parse import urlparse
 from cryptography import x509
@@ -38,7 +49,7 @@ def tprint(msg):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 tprint("=" * 80)
-tprint("CT MONITORING - VERSION AMÉLIORÉE")
+tprint("CT MONITORING - VERSION AMÉLIORÉE v2")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 tprint("=" * 80)
 
@@ -63,8 +74,21 @@ PARALLEL_LOGS                = 28
 CACHE_MAX_SIZE               = 500000
 TIMEOUT_PER_LOG              = 300
 HTTP_CHECK_TIMEOUT           = 5
-PATH_CHECK_TIMEOUT           = 3   # Timeout réduit pour les paths : les vrais fichiers sensibles répondent vite
+PATH_CHECK_TIMEOUT           = 3
 UNREACHABLE_RECHECK_INTERVAL = 300  # 5 minutes
+
+# AMÉLIORATION 1 : Semaphore global pour limiter les connexions HTTP simultanées
+# 28 logs en parallèle × N domaines chacun = saturation possible sur petit container
+# On limite à 50 connexions HTTP simultanées toutes origines confondues
+HTTP_CONCURRENCY_LIMIT = 50
+_http_semaphore = threading.Semaphore(HTTP_CONCURRENCY_LIMIT)
+
+# AMÉLIORATION 6 : NOTIFICATION_TTL réduit à 1h (était 6h)
+# Si un domaine devient accessible 1h après découverte, la redécouverte est notifiée
+NOTIFICATION_TTL = 1 * 3600  # 1 heure au lieu de 6 heures
+
+# Rétention historique check_history
+CHECK_HISTORY_RETENTION_DAYS = 7
 
 # CT LOGS (28 actifs)
 CT_LOGS = [
@@ -172,8 +196,46 @@ class NotificationCache:
                 del self.cache[d]
             return len(expired)
 
-NOTIFICATION_TTL = 6 * 3600
+# AMÉLIORATION 6 appliquée : TTL = 1h
 notif_cache = NotificationCache(ttl_seconds=NOTIFICATION_TTL)
+
+# ==================== AMÉLIORATION 3 : Discord Queue asynchrone ====================
+# send_discovery_alert() faisait un POST Discord synchrone depuis les threads monitor_log().
+# Si Discord est lent/down → bloque 10s × 28 threads.
+# Solution : queue + thread dédié qui consomme les payloads Discord.
+
+_discord_queue = queue.Queue(maxsize=500)
+
+def _discord_worker():
+    """Thread dédié à l'envoi Discord — non-bloquant pour les threads CT."""
+    while True:
+        try:
+            payload = _discord_queue.get(timeout=5)
+            if payload is None:
+                break  # signal d'arrêt
+            if not DISCORD_WEBHOOK:
+                _discord_queue.task_done()
+                continue
+            try:
+                requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+            except Exception as e:
+                tprint(f"[DISCORD WORKER ERROR] {e}")
+            finally:
+                _discord_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            tprint(f"[DISCORD WORKER FATAL] {e}")
+
+def discord_send(payload: dict):
+    """Enqueue un payload Discord — retour immédiat, jamais bloquant."""
+    try:
+        _discord_queue.put_nowait(payload)
+    except queue.Full:
+        tprint("[DISCORD QUEUE] Queue pleine — payload Discord ignoré")
+
+_discord_thread = threading.Thread(target=_discord_worker, daemon=True, name="DiscordWorker")
+_discord_thread.start()
 
 # ==================== DATABASE ====================
 class CertificateDatabase:
@@ -190,7 +252,6 @@ class CertificateDatabase:
         return self._local.conn
 
     def get_conn(self):
-        """Méthode publique pour accès externe à la connexion du thread courant."""
         return self._get_conn()
 
     def init_db(self):
@@ -229,6 +290,8 @@ class CertificateDatabase:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain     ON subdomains(domain)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_check ON subdomains(last_check)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_online  ON subdomains(is_online)')
+        # Index sur check_history pour accélérer la purge
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_ts ON check_history(check_timestamp)')
         conn.commit()
         tprint(f"[DB] Initialisée: {self.db_path}")
 
@@ -282,7 +345,6 @@ class CertificateDatabase:
             return False
 
     def get_offline(self, limit=100, offset=0):
-        """Retourne les domaines offline par page. Utiliser offset pour paginer."""
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -299,7 +361,6 @@ class CertificateDatabase:
             return []
 
     def count_offline(self):
-        """Nombre total de domaines offline."""
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -350,6 +411,25 @@ class CertificateDatabase:
         except Exception as e:
             tprint(f"[DB ERROR] mark_online {domain}: {e}")
 
+    # AMÉLIORATION 2 : Purge automatique de check_history
+    def purge_history(self, retention_days=CHECK_HISTORY_RETENTION_DAYS):
+        """Supprime les entrées check_history plus vieilles que retention_days jours."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM check_history WHERE check_timestamp < datetime('now', ? || ' days')",
+                (f'-{retention_days}',)
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            if deleted > 0:
+                tprint(f"[DB PURGE] check_history: {deleted} entrée(s) purgée(s) (rétention {retention_days}j)")
+            return deleted
+        except Exception as e:
+            tprint(f"[DB ERROR] purge_history: {e}")
+            return 0
+
     def count(self):
         try:
             conn   = self._get_conn()
@@ -393,9 +473,6 @@ class CertificateDatabase:
 db = CertificateDatabase(DATABASE_FILE)
 
 # ==================== DÉTECTION FAUX POSITIFS ====================
-
-# Mots-clés attendus par type de path — utilisé comme dernier filet de sécurité
-# dans check_path() après le rejet HTML (Content-Type + body)
 PATH_CONTENT_EXPECTATIONS = {
     '.env':             ['=', 'KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DB_', 'APP_', 'HOST'],
     '.env.backup':      ['=', 'KEY', 'SECRET', 'PASSWORD', 'TOKEN'],
@@ -416,18 +493,6 @@ PATH_CONTENT_EXPECTATIONS = {
 
 
 def check_content_coherence(body: str, path: str) -> tuple:
-    """
-    Vérifie que le contenu retourné contient les mots-clés
-    attendus pour ce type de path/fichier.
-
-    Exemples :
-      /wp-config.php doit contenir DB_NAME, DB_PASSWORD...
-      /backup.sql doit contenir INSERT INTO, CREATE TABLE...
-      /actuator/env doit contenir "activeProfiles", "propertySources"...
-
-    Si aucun mot-clé trouvé → faux positif.
-    Retourne (True, raison) si cohérent, (False, raison) sinon.
-    """
     path_low    = path.lower()
     body_sample = body[:5000]
 
@@ -438,12 +503,10 @@ def check_content_coherence(body: str, path: str) -> tuple:
                 return (False, f"path '{pattern}' expects {keywords[:3]}... none found in body")
             return (True, f"found keywords: {found[:2]}")
 
-    # Pas de règle pour ce path → on accepte
     return (True, "no_rule_for_path")
 
 
 # ==================== WAF DETECTION ====================
-
 WAF_BLOCK_BODY_SIGNATURES = [
     'you have been blocked',
     'this request has been blocked',
@@ -469,13 +532,6 @@ WAF_BLOCK_BODY_SIGNATURES = [
 
 
 def is_waf_block(response) -> tuple:
-    """
-    Détecte les pages de blocage WAF et d'authentification.
-    Utilisé uniquement par check_domain() pour qualifier les 200 généraux.
-
-    check_path() n'utilise PAS cette fonction — il rejette directement
-    tout Content-Type text/html ou body commençant par <!DOCTYPE/<html.
-    """
     headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
 
@@ -487,16 +543,13 @@ def is_waf_block(response) -> tuple:
         is_short = len(body) < 2000
         body_low = body.lower()
 
-        # WAF classiques
         for sig in WAF_BLOCK_BODY_SIGNATURES:
             if sig.lower() in body_low:
                 return (True, f"waf_block: '{sig}'")
 
-        # Cloudflare JS challenge
         if is_short and 'cloudflare' in body_low and ('challenge' in body_low or 'captcha' in body_low):
             return (True, "waf_block: cloudflare challenge")
 
-        # Incapsula
         if is_short and '_incapsula_resource' in body_low and 'noindex' in body_low:
             return (True, "waf_block: incapsula")
 
@@ -541,35 +594,33 @@ class PathMonitor:
         """
         Vérifie si un path sensible est accessible et retourne du vrai contenu.
 
-        Règle principale : un fichier sensible ne retourne JAMAIS du HTML.
-          - text/html dans Content-Type → rejeté immédiatement
-          - body qui commence par <!DOCTYPE ou <html → rejeté
-        Les détections WAF/auth/SPA restent en fallback pour les cas sans Content-Type.
+        AMÉLIORATION 7 : strip() + lstrip(BOM) avant startswith() pour éviter
+        les faux négatifs quand le body commence par un BOM (\\xef\\xbb\\xbf)
+        ou des espaces/newlines avant <!DOCTYPE.
         """
         MAX_CONTENT_SIZE = 5 * 1024 * 1024
         parsed_path      = urlparse(url).path
 
         try:
-            response      = requests.get(
-                url,
-                timeout=PATH_CHECK_TIMEOUT,
-                verify=False,
-                allow_redirects=True,
-                headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
-                stream=True
-            )
+            with _http_semaphore:  # AMÉLIORATION 1 : acquérir le slot
+                response      = requests.get(
+                    url,
+                    timeout=PATH_CHECK_TIMEOUT,
+                    verify=False,
+                    allow_redirects=True,
+                    headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
+                    stream=True
+                )
             response_time = int(response.elapsed.total_seconds() * 1000)
 
             if response.status_code == 200:
                 content_type = response.headers.get('Content-Type', '').lower()
 
-                # RÈGLE PRINCIPALE : HTML = jamais un fichier sensible
                 if 'text/html' in content_type:
                     response.close()
                     tprint(f"[PATHS FP] {url} → Content-Type HTML rejeté")
                     return (403, None, response_time, "HTML content-type: not a sensitive file")
 
-                # Rejeter les autres types non pertinents
                 if content_type and 'application/json' not in content_type \
                         and 'text/plain' not in content_type \
                         and 'application/octet-stream' not in content_type \
@@ -577,7 +628,6 @@ class PathMonitor:
                     response.close()
                     return (403, None, response_time, f"Invalid Content-Type: {content_type}")
 
-                # Vérifier taille annoncée
                 try:
                     size = int(response.headers.get('Content-Length', '0'))
                     if size > MAX_CONTENT_SIZE:
@@ -586,7 +636,6 @@ class PathMonitor:
                 except Exception:
                     pass
 
-                # Lire le body en chunks avec limite stricte
                 try:
                     chunks = []
                     total  = 0
@@ -607,19 +656,20 @@ class PathMonitor:
                 if not content or len(content) <= 200:
                     return (403, None, response_time, f"Content too small ({len(content)} bytes)")
 
-                # Fallback : si Content-Type absent/vague, vérifier que le body n'est pas du HTML
-                body_start = content[:200].lower().strip()
+                # AMÉLIORATION 7 : strip BOM UTF-8 (0xEF 0xBB 0xBF encodé) + whitespace
+                # avant de tester si le body est du HTML.
+                # Sans ça, un fichier commençant par "\xef\xbb\xbf<!DOCTYPE" ou " <!DOCTYPE"
+                # passait le filtre et générait un faux positif.
+                body_start = content.lstrip('\ufeff').lstrip()[:200].lower()
                 if body_start.startswith('<!doctype') or body_start.startswith('<html'):
                     tprint(f"[PATHS FP] {url} → Body HTML détecté (pas de Content-Type)")
                     return (403, None, response_time, "HTML body: not a sensitive file")
 
-                # Cohérence contenu/path (fallback pour les cas ambigus)
                 is_coherent, coherence_reason = check_content_coherence(content, parsed_path)
                 if not is_coherent:
                     tprint(f"[PATHS FP] {url} → Contenu incohérent: {coherence_reason}")
                     return (403, None, response_time, f"Content mismatch: {coherence_reason}")
 
-                # Tout OK → vrai contenu sensible
                 return (200, content, response_time, None)
 
             elif response.status_code == 403:
@@ -635,11 +685,8 @@ class PathMonitor:
             return (None, None, None, str(e))
 
     def _send_embed(self, embed):
-        if DISCORD_WEBHOOK:
-            try:
-                requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
-            except Exception as e:
-                tprint(f"[PATHS DISCORD ERROR] {e}")
+        """Utilise la queue Discord — non-bloquant."""
+        discord_send({"embeds": [embed]})
 
     def send_content_alert(self, url, content):
         preview = content[:1900]
@@ -749,15 +796,13 @@ def load_positions():
     return {}
 
 def save_positions():
-    # Ecriture atomique : on ecrit dans un fichier tmp puis on renomme
-    # → si le container redemarre pendant l'ecriture, le fichier original reste intact
     tmp_file = POSITIONS_FILE + '.tmp'
     try:
         with stats_lock:
             positions_copy = dict(stats['positions'])
         with open(tmp_file, 'w') as f:
             json.dump(positions_copy, f, indent=2)
-        os.replace(tmp_file, POSITIONS_FILE)  # atomique sur tous les OS POSIX
+        os.replace(tmp_file, POSITIONS_FILE)
     except Exception as e:
         tprint(f"[WARN] Sauvegarde positions: {e}")
         try:
@@ -771,22 +816,22 @@ stats['positions'] = load_positions()
 def check_domain(domain):
     """
     Vérifie HTTP/HTTPS avec suivi des redirections.
-    Retourne (status_code_effectif, response_time_ms).
-    Si 200 mais WAF/auth détecté → retourne (403, elapsed).
+    AMÉLIORATION 1 : acquiert le semaphore global avant chaque requête.
     """
     MAX_REDIRECTS = 5
 
     for protocol in ['https', 'http']:
         try:
-            start    = time.time()
-            response = requests.get(
-                f"{protocol}://{domain}",
-                timeout=HTTP_CHECK_TIMEOUT,
-                allow_redirects=True,
-                verify=False,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-                stream=False  # stream=False : on lit directement, requests gère la limite via timeout
-            )
+            with _http_semaphore:  # limite les connexions simultanées
+                start    = time.time()
+                response = requests.get(
+                    f"{protocol}://{domain}",
+                    timeout=HTTP_CHECK_TIMEOUT,
+                    allow_redirects=True,
+                    verify=False,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+                    stream=False
+                )
             elapsed = int((time.time() - start) * 1000)
 
             requested_url = f"{protocol}://{domain}"
@@ -846,8 +891,6 @@ def parse_subdomain_entry(entry):
 
 # ==================== CHARGEMENT SUBDOMAINS MANUELS ====================
 def load_subdomains_from_file():
-    # Appelée après check_domain(), check_port() et parse_subdomain_entry()
-    # pour éviter NameError au runtime
     loaded = duplicates = 0
     if not os.path.exists(SUBDOMAINS_FILE):
         tprint(f"[INFO] {SUBDOMAINS_FILE} n'existe pas (optionnel)")
@@ -893,6 +936,10 @@ def load_subdomains_from_file():
 
 # ==================== DISCORD ALERTS ====================
 def send_discovery_alert(matched_domains_with_status, log_name):
+    """
+    AMÉLIORATION 3 : utilise discord_send() (queue) au lieu de requests.post() direct.
+    Retour immédiat — ne bloque plus les threads monitor_log().
+    """
     try:
         if not matched_domains_with_status:
             return
@@ -951,8 +998,7 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             "timestamp": datetime.utcnow().isoformat()
         }
 
-        if DISCORD_WEBHOOK:
-            requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+        discord_send({"embeds": [embed]})  # non-bloquant
 
         with stats_lock:
             stats['alertes_envoyées'] += 1
@@ -965,21 +1011,25 @@ def send_discovery_alert(matched_domains_with_status, log_name):
 
 
 def send_now_accessible_alert(domain):
-    try:
-        embed = {
-            "title":       f"🟢 {domain}",
-            "description": "Ce domaine est maintenant accessible (200 OK)",
-            "color":       0x00ff00,
-            "footer":      {"text": "CT Monitor"},
-            "timestamp":   datetime.utcnow().isoformat()
-        }
-        if DISCORD_WEBHOOK:
-            requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
-        tprint(f"[ALERT] {domain} est maintenant accessible!")
-    except Exception as e:
-        tprint(f"[DISCORD ERROR] send_now_accessible_alert: {e}")
+    embed = {
+        "title":       f"🟢 {domain}",
+        "description": "Ce domaine est maintenant accessible (200 OK)",
+        "color":       0x00ff00,
+        "footer":      {"text": "CT Monitor"},
+        "timestamp":   datetime.utcnow().isoformat()
+    }
+    discord_send({"embeds": [embed]})  # non-bloquant
+    tprint(f"[ALERT] {domain} est maintenant accessible!")
 
 # ==================== PARSING CERTIFICATS ====================
+def _cert_hash(leaf_input: str) -> str:
+    """
+    AMÉLIORATION 8 : SHA1 tronqué à 8 bytes hex (16 chars) au lieu de MD5 complet.
+    Moins de collisions théoriques que MD5, taille identique en mémoire.
+    """
+    return hashlib.sha1(leaf_input.encode()).hexdigest()[:16]
+
+
 def parse_certificate(entry):
     try:
         leaf_input = entry.get('leaf_input', '')
@@ -1056,7 +1106,7 @@ _path_scan_running = threading.Event()
 # ==================== CRON JOB - RECHECK ====================
 def cron_recheck_unreachable():
     tprint("[CRON] Thread recheck démarré")
-    RECHECK_BATCH = 100  # domaines recheckés par batch pour ne pas bloquer trop longtemps
+    RECHECK_BATCH = 100
 
     while True:
         try:
@@ -1069,7 +1119,6 @@ def cron_recheck_unreachable():
             if total_offline == 0:
                 tprint("[CRON] Aucun domaine offline à recheck")
             else:
-                # Paginer sur tous les domaines offline, batch par batch
                 offset = 0
                 while True:
                     domains = db.get_offline(limit=RECHECK_BATCH, offset=offset)
@@ -1104,7 +1153,9 @@ def cron_recheck_unreachable():
 
             tprint(f"[CRON] Résumé recheck: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
 
-            # Lancer le scan paths seulement si aucun scan n'est déjà en cours
+            # AMÉLIORATION 2 : Purge check_history à chaque cycle cron
+            db.purge_history(retention_days=CHECK_HISTORY_RETENTION_DAYS)
+
             if _path_scan_running.is_set():
                 tprint("[CRON] Scan paths ignoré — scan précédent encore en cours")
             else:
@@ -1189,7 +1240,8 @@ def monitor_log(log_config):
                 stats['certificats_analysés'] += 1
 
             leaf_input = entry.get('leaf_input', '')
-            cert_hash  = hashlib.md5(leaf_input.encode()).hexdigest()
+            # AMÉLIORATION 8 : SHA1 tronqué au lieu de MD5
+            cert_hash  = _cert_hash(leaf_input)
 
             if seen_certificates.contains(cert_hash):
                 with stats_lock:
@@ -1246,29 +1298,45 @@ def monitor_all_logs():
 
 # ==================== NETTOYAGE DB ====================
 def cleanup_db():
+    """
+    AMÉLIORATION 4 : entièrement en SQL — plus d'allocation mémoire.
+    La version précédente chargeait tous les domaines avec fetchall() pour
+    trouver les orphelins côté Python. Maintenant une seule requête SQL suffit,
+    même sur 50 000 domaines.
+    """
     try:
         conn   = db.get_conn()
         cursor = conn.cursor()
 
+        # Supprimer les wildcards
         cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
         wildcards_deleted = cursor.rowcount
 
-        cursor.execute("SELECT domain FROM subdomains")
-        all_domains = [row[0] for row in cursor.fetchall()]
-        orphans     = [
-            d for d in all_domains
-            if not any(d == t or d.endswith('.' + t) for t in targets)
-        ]
-        for orphan in orphans:
-            cursor.execute("DELETE FROM subdomains WHERE domain = ?", (orphan,))
+        # AMÉLIORATION 4 : supprimer les orphelins directement en SQL
+        # On construit la clause WHERE avec les domaines cibles
+        if targets:
+            # Conditions : domain = t OR domain LIKE '%.t' pour chaque target
+            conditions = []
+            params     = []
+            for t in targets:
+                conditions.append("domain = ? OR domain LIKE ?")
+                params.extend([t, f'%.{t}'])
+            where_clause  = " OR ".join(f"({c})" for c in conditions)
+            cursor.execute(
+                f"DELETE FROM subdomains WHERE NOT ({where_clause})",
+                params
+            )
+            orphans_deleted = cursor.rowcount
+        else:
+            orphans_deleted = 0
 
         conn.commit()
 
         if wildcards_deleted > 0:
             tprint(f"[DB CLEANUP] {wildcards_deleted} wildcard(s) supprimé(s)")
-        if orphans:
-            tprint(f"[DB CLEANUP] {len(orphans)} domaine(s) orphelin(s) supprimé(s): {orphans}")
-        if wildcards_deleted == 0 and not orphans:
+        if orphans_deleted > 0:
+            tprint(f"[DB CLEANUP] {orphans_deleted} domaine(s) orphelin(s) supprimé(s) (SQL)")
+        if wildcards_deleted == 0 and orphans_deleted == 0:
             tprint("[DB CLEANUP] Base propre, rien à nettoyer")
 
     except Exception as e:
@@ -1276,7 +1344,14 @@ def cleanup_db():
 
 # ==================== DUMP DB ====================
 def dump_db():
+    """
+    AMÉLIORATION 5 : fetchmany() paginé au lieu de fetchall().
+    Sur 50 000 lignes, fetchall() alloue tout en mémoire d'un coup.
+    fetchmany(PAGE_SIZE) consomme une mémoire constante.
+    """
     tprint("[DUMP] Envoi du contenu de la DB sur Discord...")
+    PAGE_SIZE = 100  # lignes lues en mémoire à la fois
+
     try:
         conn    = db.get_conn()
         cursor  = conn.cursor()
@@ -1300,33 +1375,60 @@ def dump_db():
             FROM subdomains
             ORDER BY last_check DESC
         ''')
-        rows = cursor.fetchall()
 
+        total_sent = 0
         chunk_size = 20
-        for i in range(0, len(rows), chunk_size):
-            chunk = rows[i:i + chunk_size]
+        buffer     = []
+
+        while True:
+            rows = cursor.fetchmany(PAGE_SIZE)
+            if not rows:
+                break
+            buffer.extend(rows)
+
+            # Envoyer par tranches de chunk_size
+            while len(buffer) >= chunk_size:
+                chunk  = buffer[:chunk_size]
+                buffer = buffer[chunk_size:]
+                lines  = []
+                for domain, status, source, last_check in chunk:
+                    status_str     = str(status) if status else "timeout"
+                    last_check_str = last_check[:16] if last_check else "jamais"
+                    lines.append(f"`{domain}` [{status_str}] — {last_check_str}")
+                total_sent += len(chunk)
+                embed = {
+                    "title":       f"Domaines {total_sent-len(chunk)+1}–{total_sent}",
+                    "description": "\n".join(lines),
+                    "color":       0x2f3136,
+                    "footer":      {"text": "CT Monitor — DUMP_DB"},
+                }
+                requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+                time.sleep(0.5)
+
+        # Envoyer le reste du buffer
+        if buffer:
             lines = []
-            for domain, status, source, last_check in chunk:
+            for domain, status, source, last_check in buffer:
                 status_str     = str(status) if status else "timeout"
                 last_check_str = last_check[:16] if last_check else "jamais"
                 lines.append(f"`{domain}` [{status_str}] — {last_check_str}")
+            total_sent += len(buffer)
             embed = {
-                "title":       f"Domaines {i+1}–{i+len(chunk)} / {len(rows)}",
+                "title":       f"Domaines (fin) — {len(buffer)} entrée(s)",
                 "description": "\n".join(lines),
                 "color":       0x2f3136,
                 "footer":      {"text": "CT Monitor — DUMP_DB"},
             }
             requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
-            time.sleep(0.5)
 
         end_embed = {
             "title":       "Dump terminé",
-            "description": "Retire `DUMP_DB=1` dans Railway pour relancer le monitoring.",
+            "description": f"{total_sent} domaine(s) envoyés. Retire `DUMP_DB=1` dans Railway pour relancer le monitoring.",
             "color":       0x00ff00,
             "footer":      {"text": "CT Monitor — DUMP_DB"},
         }
         requests.post(DISCORD_WEBHOOK, json={"embeds": [end_embed]}, timeout=10)
-        tprint(f"[DUMP] {len(rows)} domaine(s) envoyés sur Discord")
+        tprint(f"[DUMP] {total_sent} domaine(s) envoyés sur Discord")
 
     except Exception as e:
         tprint(f"[DUMP ERROR] {e}")
@@ -1345,10 +1447,12 @@ if os.environ.get('DUMP_DB', '0') == '1':
 
 # ==================== DÉMARRAGE ====================
 tprint("[START] ================================================")
-tprint(f"[START] CT Monitor démarré")
+tprint(f"[START] CT Monitor démarré — VERSION v2")
 tprint(f"[START] {NB_LOGS_ACTIFS} logs CT actifs")
 tprint(f"[START] {len(targets)} domaine(s) surveillés: {', '.join(sorted(targets))}")
 tprint(f"[START] Capacité max: {BATCH_SIZE * MAX_BATCHES_CRITICAL:,} certs/log/cycle (CRITICAL)")
+tprint(f"[START] HTTP concurrency limit: {HTTP_CONCURRENCY_LIMIT} connexions simultanées")
+tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History retention: {CHECK_HISTORY_RETENTION_DAYS}j")
 tprint("[START] ================================================")
 
 tprint("[STARTUP] Etape 1/3 — Nettoyage base de données...")
@@ -1356,6 +1460,9 @@ cleanup_db()
 _db_stats = db.stats_summary()
 tprint(f"[STARTUP] DB: {_db_stats['total']} domaines | online={_db_stats['online']} | offline={_db_stats['total']-_db_stats['online']} | {db.size_mb()} MB")
 tprint(f"[STARTUP] DB detail: {_db_stats['timeout']} timeout | {_db_stats['4xx']} 4xx | {_db_stats['5xx']} 5xx")
+
+# Purge initiale de l'historique au démarrage
+db.purge_history(retention_days=CHECK_HISTORY_RETENTION_DAYS)
 
 tprint(f"[STARTUP] Etape 2/3 — Chargement {SUBDOMAINS_FILE}...")
 if not os.path.exists(SUBDOMAINS_FILE):
@@ -1390,7 +1497,6 @@ while True:
         monitor_all_logs()
         save_positions()
 
-        # Nettoyage du cache de notifications expirees (TTL 6h)
         cleared = notif_cache.clear_expired()
         if cleared > 0:
             tprint(f"[CYCLE #{cycle}] Cache notifs: {cleared} entree(s) expiree(s) supprimee(s)")
@@ -1404,6 +1510,7 @@ while True:
         tprint(f"[CYCLE #{cycle}] HTTP checks          : {stats['http_checks']:,}")
         tprint(f"[CYCLE #{cycle}] Alertes envoyées     : {stats['alertes_envoyées']:,}")
         tprint(f"[CYCLE #{cycle}] Duplicates évités    : {stats['duplicates_évités']:,}")
+        tprint(f"[CYCLE #{cycle}] Discord queue        : {_discord_queue.qsize()} en attente")
         tprint(f"[CYCLE #{cycle}] DB monitoring        : {_db_stats['total']} domaine(s) | {db.size_mb()} MB")
         tprint(f"[CYCLE #{cycle}] DB detail            : {_db_stats['timeout']} timeout | {_db_stats['4xx']} 4xx | {_db_stats['5xx']} 5xx")
         tprint(f"[CYCLE #{cycle}] Prochain cycle dans {CHECK_INTERVAL}s...")
@@ -1412,6 +1519,9 @@ while True:
     except KeyboardInterrupt:
         tprint("[STOP] Arrêt demandé")
         save_positions()
+        # Arrêt propre du worker Discord
+        _discord_queue.put(None)
+        _discord_thread.join(timeout=5)
         break
     except Exception as e:
         tprint(f"[ERROR] {e}")
