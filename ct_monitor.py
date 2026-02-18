@@ -295,7 +295,7 @@ class PathMonitor:
                 if line.startswith('http'):
                     self.paths[line] = line
                     print(f"[PATHS] ✅ Chargé: {line}")
-            print(f"[PATHS] Total: {len(self.paths)} paths\n")
+            print(f"[PATHS] Total: {len(self.paths)} paths")
         except Exception as e:
             print(f"[PATHS ERROR] {e}")
 
@@ -446,7 +446,7 @@ def load_subdomains_from_file():
             else:
                 print(f"[LOAD] 🔴 {subdomain} [{status_str}] — hors ligne, ajouté au monitoring")
 
-        print(f"\n[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB | {skipped} ignorés\n")
+        print(f"[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB | {skipped} ignorés")
         return loaded, duplicates
 
     except Exception as e:
@@ -830,19 +830,34 @@ def cleanup_db():
         print(f"[DB CLEANUP ERROR] {e}")
 
 # ==================== DÉMARRAGE ====================
-print(f"\n[START] {NB_LOGS_ACTIFS} logs CT actifs")
+print("[START] ================================================")
+print(f"[START] CT Monitor démarré")
+print(f"[START] {NB_LOGS_ACTIFS} logs CT actifs")
 print(f"[START] {len(targets)} domaine(s) surveillés: {', '.join(sorted(targets))}")
-print(f"[START] Capacité: {BATCH_SIZE * MAX_BATCHES_CRITICAL:,} certs/log/cycle (CRITICAL)")
-print("=" * 80 + "\n")
+print(f"[START] Capacité max: {BATCH_SIZE * MAX_BATCHES_CRITICAL:,} certs/log/cycle (CRITICAL)")
+print("[START] ================================================")
 
+# Nettoyage DB au démarrage (wildcards, orphelins)
+print("[STARTUP] Etape 1/3 — Nettoyage base de données...")
 cleanup_db()
-loaded_count, duplicate_count = load_subdomains_from_file()
-print(f"[STARTUP] Subdomains chargés: {loaded_count} (doublons ignorés: {duplicate_count})\n")
 
-# Thread cron recheck
+# Chargement subdomains manuels
+print(f"[STARTUP] Etape 2/3 — Chargement {SUBDOMAINS_FILE}...")
+if not os.path.exists(SUBDOMAINS_FILE):
+    print(f"[STARTUP] {SUBDOMAINS_FILE} absent — aucun sous-domaine manuel à charger")
+else:
+    loaded_count, duplicate_count = load_subdomains_from_file()
+    print(f"[STARTUP] Subdomains: {loaded_count} nouveau(x) ajouté(s), {duplicate_count} déjà en DB")
+
+# Démarrage thread cron
+print("[STARTUP] Etape 3/3 — Démarrage thread cron recheck...")
 cron_thread = threading.Thread(target=cron_recheck_unreachable, daemon=True)
 cron_thread.start()
 time.sleep(1)
+print("[STARTUP] Thread cron démarré — recheck toutes les 5 minutes")
+print("[STARTUP] ================================================")
+print("[STARTUP] Démarrage boucle principale CT monitoring...")
+print("[STARTUP] ================================================")
 
 # ==================== BOUCLE PRINCIPALE ====================
 cycle = 0
@@ -854,36 +869,32 @@ while True:
         with stats_lock:
             stats['dernière_vérification'] = datetime.utcnow()
 
-        print(f"\n{'='*80}")
-        print(f"CYCLE #{cycle} — {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        print(f"{'='*80}")
+        print(f"[CYCLE #{cycle}] ---- {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ----")
 
         monitor_all_logs()
         save_positions()
 
         cycle_duration = int(time.time() - cycle_start)
 
-        print(f"\n[DONE] Cycle #{cycle} terminé en {cycle_duration}s")
-        print(f"[STATS] Certificats analysés : {stats['certificats_analysés']:,}")
-        print(f"[STATS] Matches trouvés      : {stats['matches_trouvés']:,}")
-        print(f"[STATS] Alertes envoyées      : {stats['alertes_envoyées']:,}")
-        print(f"[STATS] HTTP checks           : {stats['http_checks']:,}")
-        print(f"[STATS] Duplicates évités     : {stats['duplicates_évités']:,}")
-        print(f"[STATS] Parse errors          : {stats['parse_errors']:,}")
-        print(f"{'='*80}")
-
-        print(f"\n[WAIT] Prochain cycle dans {CHECK_INTERVAL}s...")
+        print(f"[CYCLE #{cycle}] Terminé en {cycle_duration}s")
+        print(f"[CYCLE #{cycle}] Certificats analysés : {stats['certificats_analysés']:,}")
+        print(f"[CYCLE #{cycle}] Matches trouvés      : {stats['matches_trouvés']:,}")
+        print(f"[CYCLE #{cycle}] Alertes envoyées     : {stats['alertes_envoyées']:,}")
+        print(f"[CYCLE #{cycle}] HTTP checks          : {stats['http_checks']:,}")
+        print(f"[CYCLE #{cycle}] Duplicates évités    : {stats['duplicates_évités']:,}")
+        print(f"[CYCLE #{cycle}] Parse errors         : {stats['parse_errors']:,}")
+        print(f"[CYCLE #{cycle}] Prochain cycle dans {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n[STOP] Arrêt demandé")
+        print("[STOP] Arrêt demandé")
         save_positions()
         break
     except Exception as e:
         import traceback
-        print(f"\n[ERROR] {e}")
+        print(f"[ERROR] {e}")
         traceback.print_exc()
         save_positions()
         time.sleep(30)
 
-print("\n[STOP] Monitoring arrêté")
+print("[STOP] Monitoring arrêté")
