@@ -6,12 +6,8 @@ services:
     container_name: certstream-monitor
     restart: unless-stopped
     volumes:
-      # Volume persistant pour la base de données SQLite et positions CT
+      # Seul le data est persistant (DB SQLite + positions CT)
       - ct-data:/app/data
-      # Fichiers de configuration depuis le repo — lecture seule
-      - ./domains.txt:/app/domains.txt:ro
-      - ./subdomains.txt:/app/subdomains.txt:ro
-      - ./paths.txt:/app/paths.txt:ro
     environment:
       - TZ=UTC
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
@@ -30,7 +26,6 @@ services:
       start_period: 10s
 
 volumes:
-  # Volume Docker persistant - survit aux redémarrages
   ct-data:
     driver: local
 
