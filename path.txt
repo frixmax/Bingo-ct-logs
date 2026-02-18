@@ -1,0 +1,23 @@
+# paths.txt — Paths sensibles à scanner sur tous les sous-domaines
+# Un path par ligne — lignes commençant par # ignorées
+
+# ---- TRES HAUTE PROBABILITE ----
+/.env
+/.env.backup
+/.env.old
+/.env.prod
+/.env.production
+/.env.local
+/.git/config
+/.git/HEAD
+/wp-config.php
+/config.php
+
+# ---- HAUTE PROBABILITE ----
+/actuator/env
+/actuator/beans
+/api/v1/users
+/backup.sql
+/dump.sql
+
+# ---- CUSTOM (ajoute tes paths spécifiques ici) ----
