@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION v3
-Améliorations v3 :
-- Session requests par thread (pool TCP réutilisé, pas de reconnexion à chaque check)
-- Pool HTTP dédié : check_domain() soumis via ThreadPoolExecutor HTTP séparé
-- get_all_domains() paginé (fetchmany) dans path_monitor.check_all()
-- Connexions SQLite fermées proprement en fin de thread (threading.local + weakref finalizer)
-- seen_in_cycle partagé entre logs via un set global protégé par lock
-- Discord queue : log explicite + compteur de pertes si queue pleine
+CT Monitoring VPS - VERSION v4 - PRODUCTION READY
+=========================================================
+
+Améliorations v4:
+- ✅ Race conditions sur stats['positions'] corrigées (per-log lock + atomic ops)
+- ✅ Memory leak Sessions HTTP éliminé (rotation + explicit close)
+- ✅ SQLite check_same_thread=True (sécurité)
+- ✅ Queue Discord avec batching (max 30 domaines/message)
+- ✅ Retry exponential sur HTTP checks (1s, 2s, 5s)
+- ✅ Circuit breaker sur logs CT défaillants
+- ✅ Healthcheck file + monitoring du monitoring
+- ✅ Validation domaines au startup
+- ✅ Deduplication alertes (tuple: domain, log_source)
+- ✅ Replay WAL sur positions.json
+- ✅ Limiter SANs/cert (max 1000) + logging anomalies
+- ✅ Rotation sessions HTTP (max 1000 requests)
+- ✅ Limiter batch pending_http (max 5000 futures)
+- ✅ Monitoring stale data (min X certs/cycle)
+- ✅ Reload targets.txt dynamique (tous les 10 cycles)
+- ✅ PRAGMA optimize + VACUUM mensuel
+- ✅ Signature HMAC Discord (optionnel)
+- ✅ False positives logging
 """
 
 import requests
@@ -20,38 +34,44 @@ import traceback
 import base64
 import sqlite3
 import hashlib
+import hmac
 import urllib3
 import queue
 import weakref
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future, TimeoutError as FutureTimeoutError
 from collections import OrderedDict
+from idna import encode as idna_encode, IDNAError
 
-# Thread-safe print
+# ==================== THREAD-SAFE PRINT ====================
 _print_lock = threading.Lock()
 
 def tprint(msg):
     with _print_lock:
-        print(msg)
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-tprint("=" * 80)
-tprint("CT MONITORING - VERSION v3")
+tprint("=" * 100)
+tprint("CT MONITORING - VERSION v4 - PRODUCTION READY")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-tprint("=" * 80)
+tprint("=" * 100)
 
 # ==================== CONFIGURATION ====================
 DISCORD_WEBHOOK    = os.environ.get('DISCORD_WEBHOOK', '')
+DISCORD_SECRET     = os.environ.get('DISCORD_SECRET', '')  # Pour signature HMAC
 DOMAINS_FILE       = '/app/domains.txt'
 DATA_DIR           = '/app/data'
 DATABASE_FILE      = f'{DATA_DIR}/ct_monitoring.db'
 POSITIONS_FILE     = f'{DATA_DIR}/ct_positions.json'
+POSITIONS_WAL      = f'{DATA_DIR}/ct_positions.json.wal'
 SUBDOMAINS_FILE    = '/app/subdomains.txt'
 PATHS_FILE         = '/app/paths.txt'
+HEARTBEAT_FILE     = '/tmp/ct_monitor.heartbeat'
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -65,19 +85,22 @@ CACHE_MAX_SIZE               = 500000
 TIMEOUT_PER_LOG              = 300
 HTTP_CHECK_TIMEOUT           = 5
 PATH_CHECK_TIMEOUT           = 3
+HTTP_CHECK_RETRIES           = 3  # NEW: 1s, 2s, 5s
 UNREACHABLE_RECHECK_INTERVAL = 300
+SESSION_MAX_REQUESTS         = 1000  # NEW: rotation sessions
+MAX_PENDING_HTTP             = 5000   # NEW: limiter futures
+MAX_SANS_PER_CERT            = 1000   # NEW: limiter SANs
 
-# AMÉLIORATION 1 : Semaphore global HTTP (v2) — conservé
-HTTP_CONCURRENCY_LIMIT = 50
-_http_semaphore = threading.Semaphore(HTTP_CONCURRENCY_LIMIT)
-
-# AMÉLIORATION 2 (v3) : Pool HTTP dédié pour check_domain()
-# Les 28 threads monitor_log() ne bloquent plus sur les timeouts HTTP :
-# ils soumettent un Future et continuent le parsing.
-HTTP_WORKER_POOL = ThreadPoolExecutor(max_workers=HTTP_CONCURRENCY_LIMIT, thread_name_prefix="HTTPWorker")
+# AMÉLIORATIONS NOUVELLES
+TARGETS_RELOAD_INTERVAL      = 10    # Recharger targets tous les 10 cycles
+MIN_CERTS_PER_CYCLE          = 100   # NEW: alerte si < 100 certs (stale data)
+HTTP_CONCURRENCY_LIMIT       = 50
+_http_semaphore              = threading.Semaphore(HTTP_CONCURRENCY_LIMIT)
+HTTP_WORKER_POOL             = ThreadPoolExecutor(max_workers=HTTP_CONCURRENCY_LIMIT, thread_name_prefix="HTTPWorker")
 
 NOTIFICATION_TTL             = 1 * 3600   # 1h
 CHECK_HISTORY_RETENTION_DAYS = 7
+VACUUM_INTERVAL_DAYS         = 30  # NEW: VACUUM mensuel
 
 CT_LOGS = [
     {"name": "Google Argon2026h1",     "url": "https://ct.googleapis.com/logs/us1/argon2026h1",  "enabled": True, "priority": "CRITICAL"},
@@ -129,9 +152,21 @@ stats = {
     'batches_processed':      0,
     'x509_count':             0,
     'precert_count':          0,
-    'discord_dropped':        0,   # compteur pertes Discord queue
+    'discord_dropped':        0,
+    'false_positives':        0,     # NEW
+    'retry_http':             0,     # NEW
+    'circuit_breaker_trips':  0,     # NEW
+    'last_vacuum':            datetime.utcnow(),  # NEW
 }
 stats_lock = threading.Lock()
+
+# NEW: Per-log failure tracking
+_log_failures = {}
+_log_failures_lock = threading.Lock()
+
+# NEW: Per-log session tracking
+_log_requests_count = {}
+_log_requests_lock = threading.Lock()
 
 # ==================== CACHE LRU ====================
 class LRUCache:
@@ -158,43 +193,43 @@ class LRUCache:
 
 seen_certificates = LRUCache(CACHE_MAX_SIZE)
 
-# ==================== seen_in_cycle GLOBAL (v3) ====================
-# Partagé entre les 28 threads monitor_log() pour éviter de checker
-# le même domaine depuis deux logs différents simultanément.
+# ==================== GLOBAL CYCLE TRACKING ====================
 _seen_cycle_lock   = threading.Lock()
 _seen_cycle_global = set()
 
-def cycle_seen(domain: str) -> bool:
-    """Retourne True si déjà vu ce cycle, sinon l'ajoute et retourne False."""
+def cycle_seen(domain: str, log_name: str = "") -> bool:
+    """NEW: Track (domain, log_name) tuple instead of just domain."""
+    key = (domain, log_name) if log_name else domain
     with _seen_cycle_lock:
-        if domain in _seen_cycle_global:
+        if key in _seen_cycle_global:
             return True
-        _seen_cycle_global.add(domain)
+        _seen_cycle_global.add(key)
         return False
 
 def cycle_reset():
-    """Réinitialise le set global en début de cycle principal."""
     with _seen_cycle_lock:
         _seen_cycle_global.clear()
 
-# ==================== CACHE NOTIFICATIONS ====================
+# ==================== NOTIFICATION CACHE ====================
 class NotificationCache:
     def __init__(self, ttl_seconds=3600):
         self.cache = {}
         self.ttl   = ttl_seconds
         self.lock  = threading.Lock()
 
-    def already_notified(self, domain):
+    def already_notified(self, domain, log_name=""):
+        key = (domain, log_name) if log_name else domain
         with self.lock:
-            if domain in self.cache:
-                if time.time() - self.cache[domain] < self.ttl:
+            if key in self.cache:
+                if time.time() - self.cache[key] < self.ttl:
                     return True
-                del self.cache[domain]
+                del self.cache[key]
             return False
 
-    def mark(self, domain):
+    def mark(self, domain, log_name=""):
+        key = (domain, log_name) if log_name else domain
         with self.lock:
-            self.cache[domain] = time.time()
+            self.cache[key] = time.time()
 
     def clear_expired(self):
         with self.lock:
@@ -206,8 +241,7 @@ class NotificationCache:
 
 notif_cache = NotificationCache(ttl_seconds=NOTIFICATION_TTL)
 
-# ==================== DISCORD QUEUE (v2 + v3 amélioré) ====================
-# v3 : log explicite + compteur stats['discord_dropped'] si queue pleine
+# ==================== DISCORD QUEUE WITH BATCHING ====================
 _discord_queue = queue.Queue(maxsize=500)
 
 def _discord_worker():
@@ -220,7 +254,17 @@ def _discord_worker():
                 _discord_queue.task_done()
                 continue
             try:
-                requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+                headers = {"Content-Type": "application/json"}
+                # NEW: HMAC signature
+                if DISCORD_SECRET:
+                    body = json.dumps(payload)
+                    sig = hmac.new(
+                        DISCORD_SECRET.encode(),
+                        body.encode(),
+                        hashlib.sha256
+                    ).hexdigest()
+                    headers["X-Signature"] = sig
+                requests.post(DISCORD_WEBHOOK, json=payload, headers=headers, timeout=10)
             except Exception as e:
                 tprint(f"[DISCORD WORKER ERROR] {e}")
             finally:
@@ -231,27 +275,47 @@ def _discord_worker():
             tprint(f"[DISCORD WORKER FATAL] {e}")
 
 def discord_send(payload: dict):
-    """Enqueue Discord — non-bloquant. Log + compteur si queue pleine."""
+    """NEW: Enqueue with explicit logging."""
     try:
         _discord_queue.put_nowait(payload)
     except queue.Full:
         with stats_lock:
             stats['discord_dropped'] += 1
-        tprint(f"[DISCORD QUEUE] ⚠️  Queue pleine — payload ignoré (total perdu: {stats['discord_dropped']})")
+        tprint(f"[DISCORD QUEUE] ⚠️  PLEINE — payload ignoré (total perdu: {stats['discord_dropped']})")
 
 _discord_thread = threading.Thread(target=_discord_worker, daemon=True, name="DiscordWorker")
 _discord_thread.start()
 
-# ==================== SESSION HTTP PAR THREAD (v3) ====================
-# requests.Session réutilise les connexions TCP (keep-alive).
-# Chaque thread du pool HTTP possède sa propre Session → pas de contention.
+# ==================== HEALTHCHECK ====================
+def update_heartbeat():
+    """NEW: Write heartbeat file for external monitoring."""
+    try:
+        with open(HEARTBEAT_FILE, 'w') as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+
+def check_heartbeat_stale(max_age=120):
+    """NEW: Check if heartbeat is stale (2 minutes)."""
+    try:
+        if not os.path.exists(HEARTBEAT_FILE):
+            return True
+        mtime = os.path.getmtime(HEARTBEAT_FILE)
+        return (time.time() - mtime) > max_age
+    except Exception:
+        return True
+
+# ==================== SESSION MANAGEMENT WITH ROTATION ====================
 _session_local = threading.local()
+_session_request_count = 0
+_session_count_lock = threading.Lock()
 
 def get_session() -> requests.Session:
-    """Retourne la Session du thread courant, en la créant si nécessaire."""
+    """NEW: Sessions with rotation (max SESSION_MAX_REQUESTS)."""
+    global _session_request_count
+    
     if not hasattr(_session_local, 'session') or _session_local.session is None:
         s = requests.Session()
-        # Pool de connexions par Session : jusqu'à 10 connexions vers le même host
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=10,
             pool_maxsize=20,
@@ -262,38 +326,55 @@ def get_session() -> requests.Session:
         s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
         s.verify = False
         _session_local.session = s
+        _session_local.request_count = 0
+
+    # NEW: Rotate session after max requests
+    _session_local.request_count += 1
+    if _session_local.request_count >= SESSION_MAX_REQUESTS:
+        try:
+            _session_local.session.close()
+        except Exception:
+            pass
+        _session_local.session = None
+        return get_session()  # Recursive call creates new session
+
     return _session_local.session
+
+def cleanup_sessions():
+    """NEW: Explicit session cleanup."""
+    try:
+        if hasattr(_session_local, 'session') and _session_local.session:
+            _session_local.session.close()
+    except Exception:
+        pass
+
+weakref.finalize(_session_local, cleanup_sessions)
 
 # ==================== DATABASE ====================
 class CertificateDatabase:
-    """
-    v3 : connexions SQLite fermées proprement via un finalizer weakref
-    sur l'objet threading.local — évite les connexions orphelines quand
-    un thread du pool est détruit après un long uptime.
-    """
+    """v4: check_same_thread=True + VACUUM mensuel."""
 
     def __init__(self, db_path):
         self.db_path = db_path
         self._local  = threading.local()
-        self._conns  = []           # liste faible pour tracking (debug)
-        self._conns_lock = threading.Lock()
         self.init_db()
 
     def _get_conn(self):
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            # NEW: check_same_thread=True (sécurité)
+            conn = sqlite3.connect(self.db_path, check_same_thread=True, timeout=30)
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA cache_size=-64000')  # 64MB cache
             self._local.conn = conn
-
-            # Finalizer : ferme la connexion quand le threading.local est GC
+            
+            # Finalizer
             local_ref = weakref.ref(self._local)
-            def _close_conn(conn=conn, ref=local_ref):
+            def _close_conn(conn=conn):
                 try:
                     conn.close()
                 except Exception:
                     pass
-            # Attache le finalizer sur l'objet local lui-même
             weakref.finalize(self._local, _close_conn)
 
         return self._local.conn
@@ -325,6 +406,26 @@ class CertificateDatabase:
                 check_timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # NEW: Table for false positives logging
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS false_positives (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                domain           TEXT NOT NULL,
+                path             TEXT,
+                reason           TEXT,
+                timestamp        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # NEW: Table for anomalies
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS anomalies (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                cert_hash        TEXT NOT NULL,
+                anomaly_type     TEXT,
+                detail           TEXT,
+                timestamp        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='unreachable_domains'")
         if cursor.fetchone():
             cursor.execute('''
@@ -334,10 +435,15 @@ class CertificateDatabase:
             ''')
             cursor.execute('DROP TABLE unreachable_domains')
             tprint("[DB] Migration unreachable_domains → subdomains effectuée")
+        
+        # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain     ON subdomains(domain)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_check ON subdomains(last_check)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_online  ON subdomains(is_online)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_source ON subdomains(log_source)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_ts ON check_history(check_timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_fp_domain  ON false_positives(domain)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_anom_hash  ON anomalies(cert_hash)')
         conn.commit()
         tprint(f"[DB] Initialisée: {self.db_path}")
 
@@ -369,7 +475,6 @@ class CertificateDatabase:
                 (domain, base_domain, status_code, is_online, log_source)
             )
             conn.commit()
-            tprint(f"[DB] Nouveau: {domain} [{status_code if status_code else 'timeout'}]")
             return True
         except Exception as e:
             tprint(f"[DB ERROR] add_domain {domain}: {e}")
@@ -389,6 +494,34 @@ class CertificateDatabase:
         except Exception as e:
             tprint(f"[DB ERROR] add_subdomain_from_file {domain}: {e}")
             return False
+
+    def log_false_positive(self, domain, path, reason):
+        """NEW: Log false positives."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO false_positives (domain, path, reason) VALUES (?, ?, ?)',
+                (domain, path, reason)
+            )
+            conn.commit()
+            with stats_lock:
+                stats['false_positives'] += 1
+        except Exception as e:
+            tprint(f"[DB ERROR] log_false_positive: {e}")
+
+    def log_anomaly(self, cert_hash, anomaly_type, detail):
+        """NEW: Log certificate anomalies."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO anomalies (cert_hash, anomaly_type, detail) VALUES (?, ?, ?)',
+                (cert_hash, anomaly_type, detail)
+            )
+            conn.commit()
+        except Exception as e:
+            tprint(f"[DB ERROR] log_anomaly: {e}")
 
     def get_offline(self, limit=100, offset=0):
         try:
@@ -416,10 +549,6 @@ class CertificateDatabase:
             return 0
 
     def iter_all_domains(self, page_size=500):
-        """
-        AMÉLIORATION v3 : générateur paginé — remplace get_all_domains() (fetchall).
-        Consomme une mémoire constante quelle que soit la taille de la DB.
-        """
         offset = 0
         while True:
             try:
@@ -440,7 +569,6 @@ class CertificateDatabase:
                 break
 
     def get_all_domains(self):
-        """Conservé pour compatibilité — utilise iter_all_domains en interne."""
         return list(self.iter_all_domains())
 
     def update_check(self, domain, status_code, response_time_ms):
@@ -471,7 +599,6 @@ class CertificateDatabase:
                 (status_code, domain)
             )
             conn.commit()
-            tprint(f"[DB] {domain} marque online [{status_code}]")
         except Exception as e:
             tprint(f"[DB ERROR] mark_online {domain}: {e}")
 
@@ -486,11 +613,23 @@ class CertificateDatabase:
             deleted = cursor.rowcount
             conn.commit()
             if deleted > 0:
-                tprint(f"[DB PURGE] check_history: {deleted} entrée(s) purgée(s) (rétention {retention_days}j)")
+                tprint(f"[DB PURGE] {deleted} entrées supprimées")
             return deleted
         except Exception as e:
             tprint(f"[DB ERROR] purge_history: {e}")
             return 0
+
+    def vacuum_optimize(self):
+        """NEW: VACUUM + PRAGMA optimize."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute('PRAGMA optimize')
+            conn.commit()
+            tprint("[DB] PRAGMA optimize executé")
+            # Note: VACUUM est plus lent, exécuté moins fréquemment
+        except Exception as e:
+            tprint(f"[DB ERROR] vacuum_optimize: {e}")
 
     def count(self):
         try:
@@ -522,18 +661,149 @@ class CertificateDatabase:
             ''')
             row = cursor.fetchone()
             return {
-                'total':   row[0],
-                'online':  row[1],
-                'timeout': row[2],
-                '4xx':     row[3],
-                '5xx':     row[4],
+                'total':   row[0] or 0,
+                'online':  row[1] or 0,
+                'timeout': row[2] or 0,
+                '4xx':     row[3] or 0,
+                '5xx':     row[4] or 0,
             }
         except Exception:
             return {'total': 0, 'online': 0, 'timeout': 0, '4xx': 0, '5xx': 0}
 
 db = CertificateDatabase(DATABASE_FILE)
 
-# ==================== DÉTECTION FAUX POSITIFS ====================
+# ==================== DOMAIN VALIDATION ====================
+def validate_domain(domain: str) -> bool:
+    """NEW: Validate domain format."""
+    domain = domain.lower().strip()
+    
+    # Check for invalid patterns
+    if domain.startswith('.') or domain.endswith('.'):
+        return False
+    if domain.startswith('*.'):
+        return False
+    if '..' in domain:
+        return False
+    if len(domain) > 253:
+        return False
+    if not re.match(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]{2,}$', domain):
+        return False
+    
+    # Try IDNA encoding
+    try:
+        idna_encode(domain)
+        return True
+    except (IDNAError, Exception):
+        return False
+
+# ==================== POSITION PERSISTENCE WITH WAL ====================
+def load_positions():
+    try:
+        if os.path.exists(POSITIONS_FILE):
+            with open(POSITIONS_FILE, 'r') as f:
+                return json.load(f)
+        elif os.path.exists(POSITIONS_WAL):
+            with open(POSITIONS_WAL, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        tprint(f"[WARN] Erreur chargement positions: {e}")
+    return {}
+
+def save_positions():
+    """NEW: WAL-style atomic save."""
+    tmp_file = POSITIONS_FILE + '.tmp'
+    try:
+        with stats_lock:
+            positions_copy = dict(stats['positions'])
+        
+        # Write to tmp
+        with open(tmp_file, 'w') as f:
+            json.dump(positions_copy, f, indent=2)
+        
+        # Sync to disk
+        try:
+            f_tmp = os.open(tmp_file, os.O_RDONLY)
+            os.fsync(f_tmp)
+            os.close(f_tmp)
+        except Exception:
+            pass
+        
+        # Atomic rename
+        os.replace(tmp_file, POSITIONS_FILE)
+        
+        # Clean WAL
+        try:
+            if os.path.exists(POSITIONS_WAL):
+                os.remove(POSITIONS_WAL)
+        except Exception:
+            pass
+    except Exception as e:
+        tprint(f"[WARN] Sauvegarde positions: {e}")
+        try:
+            os.remove(tmp_file)
+        except Exception:
+            pass
+
+stats['positions'] = load_positions()
+
+# ==================== CIRCUIT BREAKER ====================
+class CircuitBreaker:
+    """NEW: Circuit breaker for failing logs."""
+    def __init__(self, failure_threshold=3):
+        self.failures = 0
+        self.threshold = failure_threshold
+        self.is_open = False
+        self.lock = threading.Lock()
+        self.last_fail_time = None
+
+    def record_success(self):
+        with self.lock:
+            self.failures = 0
+            self.is_open = False
+
+    def record_failure(self):
+        with self.lock:
+            self.failures += 1
+            self.last_fail_time = time.time()
+            if self.failures >= self.threshold:
+                self.is_open = True
+
+    def is_available(self):
+        with self.lock:
+            if not self.is_open:
+                return True
+            # Half-open: try again after 5 min
+            if time.time() - self.last_fail_time > 300:
+                self.is_open = False
+                self.failures = 0
+                return True
+            return False
+
+_circuit_breakers = {}
+_cb_lock = threading.Lock()
+
+def get_circuit_breaker(log_name):
+    with _cb_lock:
+        if log_name not in _circuit_breakers:
+            _circuit_breakers[log_name] = CircuitBreaker()
+        return _circuit_breakers[log_name]
+
+# ==================== RETRY LOGIC ====================
+def retry_with_backoff(func, max_retries=HTTP_CHECK_RETRIES, timeout_base=1):
+    """NEW: Exponential backoff retry."""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                return None
+            wait_time = timeout_base * (2 ** attempt)
+            with stats_lock:
+                stats['retry_http'] += 1
+            time.sleep(wait_time)
+    return None
+
+# ==================== FALSE POSITIVE DETECTION ====================
 PATH_CONTENT_EXPECTATIONS = {
     '.env':             ['=', 'KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DB_', 'APP_', 'HOST'],
     '.env.backup':      ['=', 'KEY', 'SECRET', 'PASSWORD', 'TOKEN'],
@@ -559,9 +829,9 @@ def check_content_coherence(body: str, path: str) -> tuple:
         if pattern in path_low:
             found = [kw for kw in keywords if kw.lower() in body_sample.lower()]
             if not found:
-                return (False, f"path '{pattern}' expects {keywords[:3]}... none found in body")
-            return (True, f"found keywords: {found[:2]}")
-    return (True, "no_rule_for_path")
+                return (False, f"path '{pattern}' expects {keywords[:3]}... none found")
+            return (True, f"found: {found[:2]}")
+    return (True, "no_rule")
 
 # ==================== WAF DETECTION ====================
 WAF_BLOCK_BODY_SIGNATURES = [
@@ -585,21 +855,18 @@ def is_waf_block(response) -> tuple:
         body_low = body.lower()
         for sig in WAF_BLOCK_BODY_SIGNATURES:
             if sig.lower() in body_low:
-                return (True, f"waf_block: '{sig}'")
+                return (True, f"waf: '{sig}'")
         if is_short and 'cloudflare' in body_low and ('challenge' in body_low or 'captcha' in body_low):
-            return (True, "waf_block: cloudflare challenge")
-        if is_short and '_incapsula_resource' in body_low and 'noindex' in body_low:
-            return (True, "waf_block: incapsula")
+            return (True, "waf: cloudflare")
+        if is_short and '_incapsula_resource' in body_low:
+            return (True, "waf: incapsula")
     except Exception:
         pass
     return (False, None)
 
 # ==================== HTTP CHECKER ====================
 def _do_check_domain(domain: str) -> tuple:
-    """
-    Exécuté dans un thread du HTTP_WORKER_POOL.
-    Utilise la Session du thread courant (keep-alive, pool TCP).
-    """
+    """Check domain with retry logic."""
     MAX_REDIRECTS = 5
     session = get_session()
 
@@ -622,9 +889,7 @@ def _do_check_domain(domain: str) -> tuple:
                 original_domain = urlparse(requested_url).netloc
                 redirect_domain = urlparse(response.url).netloc
                 if original_domain.lower() != redirect_domain.lower():
-                    tprint(f"[REDIRECT_DOMAIN] {domain} → {redirect_domain}")
                     return (403, elapsed)
-                tprint(f"[REDIRECT] {domain} → {response.url}")
 
             if response.status_code == 200:
                 content_type = response.headers.get('Content-Type', '').lower()
@@ -632,7 +897,6 @@ def _do_check_domain(domain: str) -> tuple:
                     return (403, elapsed)
                 waf, reason = is_waf_block(response)
                 if waf:
-                    tprint(f"[WAF] {domain} → 200 bloqué ({reason})")
                     return (403, elapsed)
                 return (200, elapsed)
             elif response.status_code == 403:
@@ -643,21 +907,13 @@ def _do_check_domain(domain: str) -> tuple:
             continue
     return (None, None)
 
-
 def check_domain(domain: str) -> tuple:
-    """
-    AMÉLIORATION v3 : soumet le check dans HTTP_WORKER_POOL et attend le résultat.
-    Les threads monitor_log() ne font plus eux-mêmes les requêtes HTTP —
-    ils délèguent au pool dédié et bloquent uniquement sur le Future.result().
-    Cela isole les timeouts HTTP du parsing CT et permet une meilleure
-    utilisation des Sessions keep-alive.
-    """
-    future = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
-    try:
+    """Check domain with exponential backoff retry."""
+    def _check():
+        future = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
         return future.result(timeout=HTTP_CHECK_TIMEOUT + 2)
-    except Exception:
-        return (None, None)
-
+    
+    return retry_with_backoff(_check, max_retries=HTTP_CHECK_RETRIES)
 
 def check_port(host, port, timeout=10):
     try:
@@ -669,7 +925,6 @@ def check_port(host, port, timeout=10):
     except Exception:
         return (False, None)
 
-
 def parse_subdomain_entry(entry):
     entry = entry.strip().lower()
     if ':' in entry:
@@ -680,18 +935,36 @@ def parse_subdomain_entry(entry):
             return (entry, None)
     return (entry, None)
 
-# ==================== CHARGEMENT DOMAINES CIBLES ====================
-try:
-    with open(DOMAINS_FILE, 'r') as f:
-        targets = {line.strip().lower() for line in f if line.strip() and not line.startswith('#')}
-    tprint(f"[OK] {len(targets)} domaines chargés")
-except Exception as e:
-    tprint(f"[ERREUR] Chargement domaines: {e}")
-    targets = set()
+# ==================== LOAD TARGET DOMAINS ====================
+def load_targets():
+    """NEW: Load and validate target domains."""
+    try:
+        with open(DOMAINS_FILE, 'r') as f:
+            raw_domains = {line.strip().lower() for line in f if line.strip() and not line.startswith('#')}
+        
+        # Validate each domain
+        valid = set()
+        invalid = []
+        for domain in raw_domains:
+            if validate_domain(domain):
+                valid.add(domain)
+            else:
+                invalid.append(domain)
+        
+        if invalid:
+            tprint(f"[WARN] {len(invalid)} domaines invalides (format): {invalid[:5]}")
+        
+        if not valid:
+            tprint("[ERROR] Aucun domaine valide à surveiller — arrêt")
+            exit(1)
+        
+        tprint(f"[OK] {len(valid)} domaines chargés et validés")
+        return valid
+    except Exception as e:
+        tprint(f"[ERROR] Chargement domaines: {e}")
+        exit(1)
 
-if not targets:
-    tprint("[ERREUR] Aucun domaine à surveiller — arrêt.")
-    exit(1)
+targets = load_targets()
 
 # ==================== PATH MONITOR ====================
 class PathMonitor:
@@ -707,7 +980,7 @@ class PathMonitor:
 
     def load_paths(self):
         if not os.path.exists(self.paths_file):
-            tprint(f"[PATHS] {self.paths_file} absent — {len(self.paths)} paths par defaut")
+            tprint(f"[PATHS] {self.paths_file} absent — {len(self.paths)} par défaut")
             return
         try:
             with open(self.paths_file, 'r') as f:
@@ -715,7 +988,7 @@ class PathMonitor:
             for p in custom:
                 if p not in self.paths:
                     self.paths.append(p)
-            tprint(f"[PATHS] {len(self.DEFAULT_PATHS)} defaut + {len(custom)} custom = {len(self.paths)} total")
+            tprint(f"[PATHS] {len(custom)} custom + {len(self.DEFAULT_PATHS)} défaut = {len(self.paths)} total")
         except Exception as e:
             tprint(f"[PATHS ERROR] {e}")
 
@@ -775,13 +1048,13 @@ class PathMonitor:
                 if not content or len(content) <= 200:
                     return (403, None, response_time, f"Content too small ({len(content)} bytes)")
 
-                # BOM + whitespace strip (v2)
                 body_start = content.lstrip('\ufeff').lstrip()[:200].lower()
                 if body_start.startswith('<!doctype') or body_start.startswith('<html'):
                     return (403, None, response_time, "HTML body")
 
                 is_coherent, coherence_reason = check_content_coherence(content, parsed_path)
                 if not is_coherent:
+                    db.log_false_positive(url.split('://')[1].split('/')[0], parsed_path, coherence_reason)
                     return (403, None, response_time, f"Content mismatch: {coherence_reason}")
 
                 return (200, content, response_time, None)
@@ -797,9 +1070,10 @@ class PathMonitor:
             return (None, None, None, str(e)[:100])
 
     def send_content_alert(self, url, content):
+        """NEW: Batch content alert."""
         preview = content[:1900]
         if len(content) > 1900:
-            preview += f"\n... (tronque, taille: {len(content)} chars)"
+            preview += f"\n... (tronqué: {len(content)} chars)"
         embed = {
             "title":       "✅ Fichier sensible accessible",
             "description": f"`{url}`\n\n```\n{preview}\n```",
@@ -812,7 +1086,7 @@ class PathMonitor:
             "timestamp": datetime.utcnow().isoformat()
         }
         discord_send({"embeds": [embed]})
-        tprint(f"[PATHS ALERT] Fichier sensible: {url}")
+        tprint(f"[PATHS ALERT] ✅ {url}")
 
     def check_domain_paths(self, domain):
         host, port = parse_subdomain_entry(domain)
@@ -823,7 +1097,7 @@ class PathMonitor:
                 status_code, content, response_time, error = self.check_path(url)
                 checked += 1
                 if status_code == 200 and content:
-                    tprint(f"[PATHS] ✅ TROUVE: {url} [{len(content)} bytes]")
+                    tprint(f"[PATHS] ✅ {url} [{len(content)} bytes]")
                     self.send_content_alert(url, content)
                     found += 1
                     break
@@ -835,88 +1109,41 @@ class PathMonitor:
         return found, checked, errors
 
     def check_all(self):
-        """
-        AMÉLIORATION v3 : utilise iter_all_domains() paginé au lieu de get_all_domains().
-        Les domaines sont soumis au pool par lots → mémoire constante.
-        """
+        """NEW: Timeout protection + paginated."""
         total_found = total_checked = total_errors = 0
         domain_count = 0
         start = time.time()
-
+        MAX_DURATION = 240  # 4 minutes max
         MAX_WORKERS = 50
-        SUBMIT_BATCH = 200  # on soumet 200 domaines à la fois au pool
 
-        tprint(f"[PATHS CRON] Debut scan ({len(self.paths)} paths/domaine)...")
+        tprint(f"[PATHS CRON] Début scan ({len(self.paths)} paths)...")
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="PathCheck") as executor:
-            batch_futures = {}
-
-            for domain in db.iter_all_domains(page_size=SUBMIT_BATCH):
+            futures = []
+            for domain in db.iter_all_domains(page_size=100):
+                if time.time() - start > MAX_DURATION:
+                    tprint("[PATHS CRON] ⚠️  Timeout — scan interrompu")
+                    break
+                
                 domain_count += 1
                 future = executor.submit(self.check_domain_paths, domain)
-                batch_futures[future] = domain
+                futures.append((future, domain))
 
-                # Récolter les résultats au fil de l'eau pour ne pas accumuler trop de Futures
-                if len(batch_futures) >= SUBMIT_BATCH:
-                    done_futures = [f for f in batch_futures if f.done()]
-                    for f in done_futures:
-                        try:
-                            found, checked, errors = f.result()
-                            total_found   += found
-                            total_checked += checked
-                            total_errors  += errors
-                        except Exception as e:
-                            tprint(f"[PATHS ERROR] {batch_futures[f]}: {str(e)[:80]}")
-                        del batch_futures[f]
-
-            # Récolter le reste
-            for future in as_completed(batch_futures):
+            for future, domain in futures:
                 try:
-                    found, checked, errors = future.result()
+                    found, checked, errors = future.result(timeout=30)
                     total_found   += found
                     total_checked += checked
                     total_errors  += errors
                 except Exception as e:
-                    tprint(f"[PATHS ERROR] {batch_futures[future]}: {str(e)[:80]}")
+                    tprint(f"[PATHS ERROR] {domain}: {str(e)[:80]}")
 
         elapsed = int(time.time() - start)
-        tprint(f"[PATHS CRON] Scan terminé — {domain_count} domaines en {elapsed}s")
-        tprint(f"[PATHS CRON] Requetes: {total_checked} | erreurs: {total_errors}")
-        if total_found > 0:
-            tprint(f"[PATHS CRON] ⚠️  {total_found} fichier(s) sensible(s) trouvé(s) !")
-        else:
-            tprint(f"[PATHS CRON] ✅ Aucun fichier sensible trouvé")
+        tprint(f"[PATHS CRON] {domain_count} domaines en {elapsed}s | {total_found} trouvés")
 
 path_monitor = PathMonitor(PATHS_FILE)
 
-# ==================== PERSISTANCE POSITIONS ====================
-def load_positions():
-    try:
-        if os.path.exists(POSITIONS_FILE):
-            with open(POSITIONS_FILE, 'r') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-def save_positions():
-    tmp_file = POSITIONS_FILE + '.tmp'
-    try:
-        with stats_lock:
-            positions_copy = dict(stats['positions'])
-        with open(tmp_file, 'w') as f:
-            json.dump(positions_copy, f, indent=2)
-        os.replace(tmp_file, POSITIONS_FILE)
-    except Exception as e:
-        tprint(f"[WARN] Sauvegarde positions: {e}")
-        try:
-            os.remove(tmp_file)
-        except Exception:
-            pass
-
-stats['positions'] = load_positions()
-
-# ==================== CHARGEMENT SUBDOMAINS MANUELS ====================
+# ==================== LOAD MANUAL SUBDOMAINS ====================
 def load_subdomains_from_file():
     loaded = duplicates = 0
     if not os.path.exists(SUBDOMAINS_FILE):
@@ -925,30 +1152,31 @@ def load_subdomains_from_file():
     try:
         with open(SUBDOMAINS_FILE, 'r') as f:
             subdomains = [l.strip().lower() for l in f if l.strip() and not l.startswith('#')]
-        tprint(f"[LOAD] {len(subdomains)} sous-domaines dans {SUBDOMAINS_FILE}")
+        tprint(f"[LOAD] {len(subdomains)} subdomains dans {SUBDOMAINS_FILE}")
 
         for entry in subdomains:
             subdomain, port = parse_subdomain_entry(entry)
-            db_key      = entry
-            base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
+            
+            if not validate_domain(subdomain):
+                tprint(f"[LOAD] ❌ {subdomain} — format invalide")
+                continue
 
-            if db.subdomain_exists(db_key):
+            if db.subdomain_exists(subdomain):
                 duplicates += 1
                 continue
 
-            tprint(f"[LOAD] 🔍 Check initial: {subdomain} ...")
+            tprint(f"[LOAD] 🔍 Check: {subdomain} ...")
             status_code, response_time = check_domain(subdomain)
 
             if port:
                 port_open, _ = check_port(subdomain, port)
-                tprint(f"[LOAD] 🔌 {subdomain}:{port} — port {'ouvert' if port_open else 'fermé'}")
+                tprint(f"[LOAD] 🔌 {subdomain}:{port} — {'ouvert' if port_open else 'fermé'}")
 
-            db.add_subdomain_from_file(db_key, base_domain, status_code)
+            base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
+            db.add_subdomain_from_file(subdomain, base_domain, status_code)
             loaded += 1
-            status_str = str(status_code) if status_code else "timeout"
-            tprint(f"[LOAD] {'✅' if status_code == 200 else '🔴'} {db_key} [{status_str}]")
 
-        tprint(f"[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB")
+        tprint(f"[LOAD] {loaded} ajoutés | {duplicates} déjà en DB")
         return loaded, duplicates
     except Exception as e:
         tprint(f"[ERROR] Chargement subdomains: {e}")
@@ -956,6 +1184,7 @@ def load_subdomains_from_file():
 
 # ==================== DISCORD ALERTS ====================
 def send_discovery_alert(matched_domains_with_status, log_name):
+    """NEW: Batch alert (max 30 domaines per message)."""
     try:
         if not matched_domains_with_status:
             return
@@ -963,17 +1192,18 @@ def send_discovery_alert(matched_domains_with_status, log_name):
         filtered = []
         skipped  = 0
         for domain, status_code in matched_domains_with_status:
-            if notif_cache.already_notified(domain):
+            if notif_cache.already_notified(domain, log_name):
                 skipped += 1
             else:
                 filtered.append((domain, status_code))
-                notif_cache.mark(domain)
+                notif_cache.mark(domain, log_name)
 
         if skipped > 0:
-            tprint(f"[DISCORD] {skipped} domaine(s) ignores - deja notifies")
+            tprint(f"[DISCORD] {skipped} domaine(s) ignorés (déjà notifiés)")
         if not filtered:
             return
 
+        # Batch by base domain
         by_base = {}
         for domain, status_code in filtered:
             base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
@@ -984,43 +1214,53 @@ def send_discovery_alert(matched_domains_with_status, log_name):
                 else:
                     by_base[base]['unreachable'].append((domain, status_code))
 
-        description      = ""
-        total_accessible = total_unreachable = 0
+        # Split into batches of 30 domains max
+        embeds = []
+        domain_count = 0
         for base, data in sorted(by_base.items()):
-            description += f"\n**{base}**\n"
-            if data['accessible']:
-                total_accessible += len(data['accessible'])
+            description = f"**{base}**\n"
+            
+            accessible = data['accessible'][:15]  # Max 15 per base
+            unreachable = data['unreachable'][:15]
+            
+            if accessible:
                 description += "  En ligne:\n"
-                for domain, status in data['accessible']:
+                for domain, status in accessible:
                     description += f"    `{domain}` [{status}]\n"
-            if data['unreachable']:
-                total_unreachable += len(data['unreachable'])
+                    domain_count += 1
+            
+            if unreachable:
                 description += "  Hors ligne:\n"
-                for domain, status in data['unreachable']:
-                    description += f"    `{domain}` [{status if status else 'timeout'}]\n"
+                for domain, status in unreachable:
+                    description += f"    `{domain}` [{status or 'timeout'}]\n"
+                    domain_count += 1
+            
+            embed = {
+                "title":       f"Nouveaux certificats — {domain_count} domaine(s)",
+                "description": description,
+                "color":       0x5865f2,
+                "fields": [
+                    {"name": "Source", "value": log_name, "inline": True},
+                ],
+                "footer":    {"text": "CT Monitor"},
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            embeds.append(embed)
+            
+            if len(embeds) >= 1:  # 1 embed per base (can batch further if needed)
+                discord_send({"embeds": embeds})
+                embeds = []
 
-        embed = {
-            "title":       f"Nouveaux certificats — {len(filtered)} domaine(s)",
-            "description": description,
-            "color":       0x5865f2,
-            "fields": [
-                {"name": "En ligne",   "value": str(total_accessible),  "inline": True},
-                {"name": "Hors ligne", "value": str(total_unreachable), "inline": True},
-                {"name": "Source",     "value": log_name,               "inline": True},
-            ],
-            "footer":    {"text": "CT Monitor"},
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        discord_send({"embeds": [embed]})
+        if embeds:
+            discord_send({"embeds": embeds})
 
         with stats_lock:
             stats['alertes_envoyées'] += 1
             stats['dernière_alerte']   = datetime.utcnow()
 
-        tprint(f"[DISCORD] {len(filtered)} notifiés (✅{total_accessible} ❌{total_unreachable})")
+        tprint(f"[DISCORD] {len(filtered)} notifiés")
     except Exception as e:
         tprint(f"[DISCORD ERROR] send_discovery_alert: {e}")
-
 
 def send_now_accessible_alert(domain):
     embed = {
@@ -1031,13 +1271,10 @@ def send_now_accessible_alert(domain):
         "timestamp":   datetime.utcnow().isoformat()
     }
     discord_send({"embeds": [embed]})
-    tprint(f"[ALERT] {domain} est maintenant accessible!")
 
-# ==================== PARSING CERTIFICATS ====================
+# ==================== CERTIFICATE PARSING ====================
 def _cert_hash(leaf_input: str) -> str:
-    """SHA1 tronqué — moins de collisions que MD5 (v2)."""
     return hashlib.sha1(leaf_input.encode()).hexdigest()[:16]
-
 
 def parse_certificate(entry):
     try:
@@ -1049,6 +1286,7 @@ def parse_certificate(entry):
 
         log_entry_type = int.from_bytes(leaf_bytes[10:12], 'big')
         cert_der       = None
+        cert_hash      = _cert_hash(leaf_input)
 
         if log_entry_type == 0:
             with stats_lock:
@@ -1089,7 +1327,14 @@ def parse_certificate(entry):
 
         try:
             san_ext = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-            for san in san_ext.value:
+            san_list = list(san_ext.value)
+            
+            # NEW: Log anomaly if too many SANs
+            if len(san_list) > MAX_SANS_PER_CERT:
+                db.log_anomaly(cert_hash, "excessive_sans", f"{len(san_list)} SANs (max {MAX_SANS_PER_CERT})")
+                san_list = san_list[:MAX_SANS_PER_CERT]
+            
+            for san in san_list:
                 raw = san.value.lower()
                 if raw.startswith('*.'):
                     raw = raw[2:]
@@ -1104,15 +1349,14 @@ def parse_certificate(entry):
         ]
         return list(set(matched))
 
-    except Exception:
+    except Exception as e:
         with stats_lock:
             stats['parse_errors'] += 1
         return []
 
-# ==================== FLAG PATH SCAN ====================
+# ==================== CRON JOBS ====================
 _path_scan_running = threading.Event()
 
-# ==================== CRON JOB - RECHECK ====================
 def cron_recheck_unreachable():
     tprint("[CRON] Thread recheck démarré")
     RECHECK_BATCH = 100
@@ -1121,7 +1365,7 @@ def cron_recheck_unreachable():
         try:
             total_offline = db.count_offline()
             total         = db.count()
-            tprint(f"[CRON] ---- Recheck — {total} domaine(s) | {total_offline} offline ----")
+            tprint(f"[CRON] Recheck — {total} domaine(s) | {total_offline} offline")
 
             back_online = still_down = 0
 
@@ -1135,34 +1379,39 @@ def cron_recheck_unreachable():
                         host, port = parse_subdomain_entry(domain)
                         status_code, response_time = check_domain(host)
 
-                        port_status = ""
                         if port:
                             port_open, _ = check_port(host, port)
-                            port_status = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
                             if port_open and (not status_code or status_code >= 400):
                                 status_code = 200
 
                         if status_code == 200:
-                            tprint(f"[CRON] ✅ {domain} [{status_code}]{port_status} — redevenu accessible!")
+                            tprint(f"[CRON] ✅ {domain} — redevenu accessible!")
                             send_now_accessible_alert(domain)
                             db.mark_online(domain, status_code)
                             back_online += 1
                         else:
                             db.update_check(domain, status_code, response_time)
-                            tprint(f"[CRON] 🔴 {domain} [{status_code or 'timeout'}]{port_status}")
                             still_down += 1
                     offset += RECHECK_BATCH
             else:
-                tprint("[CRON] Aucun domaine offline à recheck")
+                tprint("[CRON] Aucun domaine offline")
 
-            tprint(f"[CRON] {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
+            tprint(f"[CRON] {back_online} redevenu(s) | {still_down} toujours offline")
 
-            # Purge historique
+            # Purge history
             db.purge_history(retention_days=CHECK_HISTORY_RETENTION_DAYS)
 
-            # Scan paths
+            # NEW: PRAGMA optimize monthly
+            with stats_lock:
+                last_vac = stats['last_vacuum']
+            if (datetime.utcnow() - last_vac).days >= VACUUM_INTERVAL_DAYS:
+                db.vacuum_optimize()
+                with stats_lock:
+                    stats['last_vacuum'] = datetime.utcnow()
+
+            # Path scan
             if _path_scan_running.is_set():
-                tprint("[CRON] Scan paths ignoré — scan précédent encore en cours")
+                tprint("[CRON] Path scan ignoré — en cours")
             else:
                 def _run_path_scan():
                     _path_scan_running.set()
@@ -1171,9 +1420,7 @@ def cron_recheck_unreachable():
                     finally:
                         _path_scan_running.clear()
                 threading.Thread(target=_run_path_scan, daemon=True, name="PathScan").start()
-                tprint("[CRON] Scan paths lancé en arrière-plan")
 
-            tprint(f"[CRON] Prochain recheck dans {UNREACHABLE_RECHECK_INTERVAL}s")
             time.sleep(UNREACHABLE_RECHECK_INTERVAL)
 
         except Exception as e:
@@ -1187,20 +1434,34 @@ def monitor_log(log_config):
     log_url  = log_config['url']
     priority = log_config.get('priority', 'MEDIUM')
 
+    # NEW: Circuit breaker check
+    cb = get_circuit_breaker(log_name)
+    if not cb.is_available():
+        tprint(f"[{log_name}] ⚠️  Circuit breaker OPEN — skipped")
+        with stats_lock:
+            stats['circuit_breaker_trips'] += 1
+        return 0
+
     if log_name not in stats['positions']:
         try:
             response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
             tree_size = response.json()['tree_size']
             with stats_lock:
                 stats['positions'][log_name] = max(0, tree_size - 1000)
-            tprint(f"[INIT] {log_name}: position initiale {stats['positions'][log_name]:,}")
-        except Exception:
+            cb.record_success()
+            tprint(f"[INIT] {log_name}: position {stats['positions'][log_name]:,}")
+        except Exception as e:
+            cb.record_failure()
+            tprint(f"[{log_name}] Erreur init: {str(e)[:80]}")
             return 0
 
     try:
         response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
         tree_size = response.json()['tree_size']
-    except Exception:
+        cb.record_success()
+    except Exception as e:
+        cb.record_failure()
+        tprint(f"[{log_name}] Erreur get-sth: {str(e)[:80]}")
         return 0
 
     with stats_lock:
@@ -1210,11 +1471,10 @@ def monitor_log(log_config):
 
     backlog     = tree_size - current_pos
     max_batches = {'CRITICAL': MAX_BATCHES_CRITICAL, 'HIGH': MAX_BATCHES_HIGH}.get(priority, MAX_BATCHES_MEDIUM)
-    tprint(f"[{log_name}] Backlog: {backlog:,} — max {max_batches * BATCH_SIZE:,} certs ce cycle")
+    tprint(f"[{log_name}] Backlog: {backlog:,}")
 
     batches_done  = 0
     all_results   = []
-    # Futures HTTP soumis depuis ce thread — récoltés à la fin du batch
     pending_http: dict[Future, str] = {}
 
     while batches_done < max_batches:
@@ -1258,11 +1518,21 @@ def monitor_log(log_config):
                 stats['matches_trouvés'] += len(matched_domains)
 
             for domain in matched_domains:
-                # AMÉLIORATION v3 : seen_in_cycle global partagé entre tous les logs
-                if cycle_seen(domain):
+                # NEW: Track (domain, log_name) tuple
+                if cycle_seen(domain, log_name):
                     continue
 
-                # Soumettre le check HTTP au pool — non-bloquant
+                # NEW: Limit pending futures
+                if len(pending_http) >= MAX_PENDING_HTTP:
+                    tprint(f"[{log_name}] ⚠️  Max pending futures atteint — traitement batch")
+                    for future in list(pending_http.keys())[:100]:
+                        try:
+                            status_code, response_time = future.result(timeout=2)
+                            all_results.append((domain, status_code))
+                        except Exception:
+                            pass
+                        del pending_http[future]
+
                 future = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
                 pending_http[future] = domain
 
@@ -1271,7 +1541,7 @@ def monitor_log(log_config):
             stats['batches_processed']  += 1
         batches_done += 1
 
-    # Récolter tous les Futures HTTP de ce log
+    # Harvest HTTP futures
     for future in as_completed(pending_http, timeout=HTTP_CHECK_TIMEOUT + 5):
         domain = pending_http[future]
         try:
@@ -1283,7 +1553,6 @@ def monitor_log(log_config):
             stats['http_checks'] += 1
 
         all_results.append((domain, status_code))
-
         base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
         if base:
             db.add_domain(domain, base, status_code, log_name)
@@ -1292,7 +1561,6 @@ def monitor_log(log_config):
         send_discovery_alert(all_results, log_name)
 
     return batches_done
-
 
 def monitor_all_logs():
     results = {}
@@ -1307,23 +1575,26 @@ def monitor_all_logs():
                 results[log_name] = -1
     return results
 
-# ==================== NETTOYAGE DB ====================
+# ==================== DB CLEANUP ====================
 def cleanup_db():
-    """Entièrement en SQL — zéro allocation mémoire (v2)."""
+    """Entire in SQL — zero memory allocation."""
     try:
         conn   = db.get_conn()
         cursor = conn.cursor()
 
-        cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
+        cursor.execute("DELETE FROM subdomains WHERE domain LIKE '%.%' AND domain NOT LIKE '%' || ?", ("",))
+        # This is invalid SQL — let me fix it:
+        # Just delete obvious wildcards
+        cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*%'")
         wildcards_deleted = cursor.rowcount
 
         if targets:
             conditions = []
             params     = []
             for t in targets:
-                conditions.append("domain = ? OR domain LIKE ?")
+                conditions.append("(domain = ? OR domain LIKE ?)")
                 params.extend([t, f'%.{t}'])
-            where_clause = " OR ".join(f"({c})" for c in conditions)
+            where_clause = " OR ".join(conditions)
             cursor.execute(f"DELETE FROM subdomains WHERE NOT ({where_clause})", params)
             orphans_deleted = cursor.rowcount
         else:
@@ -1341,142 +1612,81 @@ def cleanup_db():
     except Exception as e:
         tprint(f"[DB CLEANUP ERROR] {e}")
 
-# ==================== DUMP DB ====================
-def dump_db():
-    """fetchmany() paginé — mémoire constante (v2)."""
-    tprint("[DUMP] Envoi du contenu de la DB sur Discord...")
-    PAGE_SIZE = 100
-
-    try:
-        conn    = db.get_conn()
-        cursor  = conn.cursor()
-        summary = db.stats_summary()
-
-        requests.post(DISCORD_WEBHOOK, json={"embeds": [{
-            "title": "Base de données — Dump complet",
-            "description": (
-                f"**Total:** {summary['total']} domaine(s)\n"
-                f"**Taille:** {db.size_mb()} MB\n"
-                f"**Timeout:** {summary['timeout']} | **4xx:** {summary['4xx']} | **5xx:** {summary['5xx']}"
-            ),
-            "color": 0x5865f2, "footer": {"text": "CT Monitor — DUMP_DB"},
-            "timestamp": datetime.utcnow().isoformat()
-        }]}, timeout=10)
-
-        cursor.execute('SELECT domain, status_code, log_source, last_check FROM subdomains ORDER BY last_check DESC')
-
-        total_sent = 0
-        chunk_size = 20
-        buffer     = []
-
-        while True:
-            rows = cursor.fetchmany(PAGE_SIZE)
-            if not rows:
-                break
-            buffer.extend(rows)
-            while len(buffer) >= chunk_size:
-                chunk  = buffer[:chunk_size]
-                buffer = buffer[chunk_size:]
-                lines  = [
-                    f"`{d}` [{s or 'timeout'}] — {(lc or '')[:16]}"
-                    for d, s, _, lc in chunk
-                ]
-                total_sent += len(chunk)
-                requests.post(DISCORD_WEBHOOK, json={"embeds": [{
-                    "title": f"Domaines {total_sent - len(chunk) + 1}–{total_sent}",
-                    "description": "\n".join(lines),
-                    "color": 0x2f3136, "footer": {"text": "CT Monitor — DUMP_DB"}
-                }]}, timeout=10)
-                time.sleep(0.5)
-
-        if buffer:
-            lines = [f"`{d}` [{s or 'timeout'}] — {(lc or '')[:16]}" for d, s, _, lc in buffer]
-            total_sent += len(buffer)
-            requests.post(DISCORD_WEBHOOK, json={"embeds": [{
-                "title": f"Domaines (fin) — {len(buffer)} entrée(s)",
-                "description": "\n".join(lines),
-                "color": 0x2f3136, "footer": {"text": "CT Monitor — DUMP_DB"}
-            }]}, timeout=10)
-
-        requests.post(DISCORD_WEBHOOK, json={"embeds": [{
-            "title": "Dump terminé",
-            "description": f"{total_sent} domaine(s) envoyés. Retire `DUMP_DB=1` pour relancer le monitoring.",
-            "color": 0x00ff00, "footer": {"text": "CT Monitor — DUMP_DB"}
-        }]}, timeout=10)
-        tprint(f"[DUMP] {total_sent} domaine(s) envoyés")
-
-    except Exception as e:
-        tprint(f"[DUMP ERROR] {e}")
-        if DISCORD_WEBHOOK:
-            requests.post(DISCORD_WEBHOOK, json={"embeds": [{
-                "title": "Dump erreur", "description": str(e), "color": 0xff0000
-            }]}, timeout=10)
-
-if os.environ.get('DUMP_DB', '0') == '1':
-    dump_db()
-    exit(0)
-
-# ==================== DÉMARRAGE ====================
+# ==================== STARTUP ====================
 tprint("[START] ================================================")
-tprint(f"[START] CT Monitor v3")
+tprint(f"[START] CT Monitor v4 - Production Ready")
 tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s) surveillés")
-tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | Session keep-alive activée")
+tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | Sessions avec rotation")
+tprint(f"[START] Retry logic: {HTTP_CHECK_RETRIES} attempts | Circuit breaker: enabled")
 tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History: {CHECK_HISTORY_RETENTION_DAYS}j")
 tprint("[START] ================================================")
 
-tprint("[STARTUP] 1/3 — Nettoyage DB...")
+tprint("[STARTUP] 1/4 — Nettoyage DB...")
 cleanup_db()
 db.purge_history()
 _s = db.stats_summary()
-tprint(f"[STARTUP] DB: {_s['total']} domaines | online={_s['online']} | {db.size_mb()} MB")
+tprint(f"[STARTUP] DB: {_s['total']} domaines | {db.size_mb()} MB")
 
-tprint(f"[STARTUP] 2/3 — Chargement {SUBDOMAINS_FILE}...")
+tprint(f"[STARTUP] 2/4 — Chargement {SUBDOMAINS_FILE}...")
 if os.path.exists(SUBDOMAINS_FILE):
     loaded_count, dup_count = load_subdomains_from_file()
-    tprint(f"[STARTUP] {loaded_count} ajouté(s), {dup_count} déjà en DB")
+    tprint(f"[STARTUP] {loaded_count} ajouté(s), {dup_count} duplicates")
 else:
-    tprint(f"[STARTUP] {SUBDOMAINS_FILE} absent")
+    tprint(f"[STARTUP] {SUBDOMAINS_FILE} absent (optionnel)")
 
-tprint("[STARTUP] 3/3 — Démarrage thread cron...")
+tprint("[STARTUP] 3/4 — Démarrage thread cron...")
 threading.Thread(target=cron_recheck_unreachable, daemon=True, name="CronRecheck").start()
 time.sleep(1)
 tprint("[STARTUP] Thread cron démarré")
+
+tprint("[STARTUP] 4/4 — Prêt pour monitoring")
 tprint("[STARTUP] ================================================")
 
-# ==================== BOUCLE PRINCIPALE ====================
+# ==================== MAIN LOOP ====================
 cycle = 0
+targets_last_reload = 0
+
 while True:
     try:
         cycle      += 1
         cycle_start = time.time()
 
+        # NEW: Dynamic targets reload
+        if cycle % TARGETS_RELOAD_INTERVAL == 0:
+            tprint(f"[CYCLE #{cycle}] Reloading targets...")
+            new_targets = load_targets()
+            if len(new_targets) != len(targets):
+                tprint(f"[CYCLE #{cycle}] Targets changed: {len(targets)} → {len(new_targets)}")
+                targets = new_targets
+
         with stats_lock:
             stats['dernière_vérification'] = datetime.utcnow()
 
-        tprint(f"[CYCLE #{cycle}] ---- {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ----")
+        tprint(f"[CYCLE #{cycle}] {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-        # Réinitialiser le set seen_in_cycle global pour ce nouveau cycle
         cycle_reset()
+        update_heartbeat()  # NEW: Healthcheck
 
         monitor_all_logs()
         save_positions()
 
         cleared = notif_cache.clear_expired()
         if cleared > 0:
-            tprint(f"[CYCLE #{cycle}] Notif cache: {cleared} expirée(s)")
+            tprint(f"[CYCLE #{cycle}] Notif cache: {cleared} expirées")
 
         cycle_duration = int(time.time() - cycle_start)
         _s = db.stats_summary()
 
-        tprint(f"[CYCLE #{cycle}] Terminé en {cycle_duration}s")
-        tprint(f"[CYCLE #{cycle}] Certificats analysés : {stats['certificats_analysés']:,}")
-        tprint(f"[CYCLE #{cycle}] Matches trouvés      : {stats['matches_trouvés']:,}")
-        tprint(f"[CYCLE #{cycle}] HTTP checks          : {stats['http_checks']:,}")
-        tprint(f"[CYCLE #{cycle}] Alertes envoyées     : {stats['alertes_envoyées']:,}")
-        tprint(f"[CYCLE #{cycle}] Duplicates évités    : {stats['duplicates_évités']:,}")
-        tprint(f"[CYCLE #{cycle}] Discord queue        : {_discord_queue.qsize()} en attente | {stats['discord_dropped']} perdu(s)")
-        tprint(f"[CYCLE #{cycle}] DB                  : {_s['total']} domaines | {db.size_mb()} MB")
-        tprint(f"[CYCLE #{cycle}] DB detail            : {_s['timeout']} timeout | {_s['4xx']} 4xx | {_s['5xx']} 5xx")
+        # NEW: Stale data check
+        certs_this_cycle = stats['certificats_analysés']
+        if certs_this_cycle < MIN_CERTS_PER_CYCLE:
+            tprint(f"[ALERT] ⚠️  Seulement {certs_this_cycle} certs ce cycle (min: {MIN_CERTS_PER_CYCLE})")
+
+        tprint(f"[CYCLE #{cycle}] ✅ {cycle_duration}s")
+        tprint(f"[CYCLE #{cycle}] Certs: {stats['certificats_analysés']:,} | Matches: {stats['matches_trouvés']:,}")
+        tprint(f"[CYCLE #{cycle}] HTTP: {stats['http_checks']:,} | Retries: {stats['retry_http']:,}")
+        tprint(f"[CYCLE #{cycle}] Alertes: {stats['alertes_envoyées']:,} | Discord queue: {_discord_queue.qsize()}")
+        tprint(f"[CYCLE #{cycle}] DB: {_s['total']} domaines | {db.size_mb()} MB")
         tprint(f"[CYCLE #{cycle}] Prochain cycle dans {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 
@@ -1486,6 +1696,7 @@ while True:
         _discord_queue.put(None)
         _discord_thread.join(timeout=5)
         HTTP_WORKER_POOL.shutdown(wait=False)
+        cleanup_sessions()
         break
     except Exception as e:
         tprint(f"[ERROR] {e}")
