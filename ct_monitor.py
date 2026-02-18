@@ -398,37 +398,21 @@ db = CertificateDatabase(DATABASE_FILE)
 class PathMonitor:
     # Paths predefinies — chargees depuis paths.txt + defaults integres
     DEFAULT_PATHS = [
-        # Tres haute probabilite
-        "/.env", "/.env.local", "/.env.production", "/.env.prod",
-        "/.env.backup", "/.env.old", "/.env.dev", "/.env.staging",
-        "/.git/config", "/.git/HEAD", "/.git/FETCH_HEAD",
-        "/wp-config.php", "/config.php", "/configuration.php",
-        "/config.yml", "/config.yaml", "/config.json",
-        "/database.yml", "/database.yaml",
-        "/settings.py", "/local_settings.py",
-        "/secrets.yml", "/secrets.json", "/credentials.json",
-        # Haute probabilite
-        "/actuator", "/actuator/env", "/actuator/health",
-        "/actuator/beans", "/actuator/mappings", "/actuator/logfile",
-        "/backup.sql", "/dump.sql", "/db.sql", "/database.sql",
-        "/.aws/credentials", "/.aws/config",
-        "/phpinfo.php", "/info.php", "/test.php",
-        "/server-status", "/server-info",
-        # Panels admin
-        "/admin", "/admin/", "/administrator", "/administrator/",
-        "/wp-admin/", "/phpmyadmin/", "/pma/", "/cpanel",
-        # APIs et documentation
-        "/swagger", "/swagger-ui.html", "/swagger-ui/",
-        "/api-docs", "/api/docs", "/api/v1/", "/api/v2/",
-        "/graphql", "/graphiql",
-        "/api/swagger.json", "/api/openapi.json",
-        # Consoles et debug
-        "/console", "/h2-console", "/debug", "/trace",
-        "/metrics", "/health", "/status", "/jolokia",
-        # Logs
-        "/error.log", "/access.log", "/debug.log", "/app.log",
-        # CI/CD et infra
-        "/.kube/config", "/docker-compose.yml", "/docker-compose.yaml",
+        "/.env",
+        "/.env.backup",
+        "/.env.old",
+        "/.env.prod",
+        "/.env.production",
+        "/.env.local",
+        "/.git/config",
+        "/.git/HEAD",
+        "/wp-config.php",
+        "/config.php",
+        "/actuator/env",
+        "/actuator/beans",
+        "/api/v1/users",
+        "/backup.sql",
+        "/dump.sql",
     ]
 
     def __init__(self, paths_file):
