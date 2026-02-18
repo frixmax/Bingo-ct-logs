@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     && pip install --no-cache-dir requests cryptography
 
 # Copie des fichiers
-COPY ct_all_logs.py .
+COPY ct_monitor.py .
 COPY domains.txt .
 
 EXPOSE 10000
@@ -20,4 +20,4 @@ EXPOSE 10000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${PORT:-10000}/health || exit 1
 
-CMD ["python3", "-u", "ct_all_logs.py"]
+CMD ["python3", "-u", "ct_monitor.py"]
