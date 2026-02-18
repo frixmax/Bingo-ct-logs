@@ -254,7 +254,7 @@ class CertificateDatabase:
             return False
 
     def add_domain(self, domain, base_domain, status_code, log_source):
-        is_online = 1 if (status_code and (200 <= status_code < 500 or status_code == 431)) else 0
+        is_online = 1 if status_code == 200 else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -278,7 +278,7 @@ class CertificateDatabase:
             return False
 
     def add_subdomain_from_file(self, domain, base_domain, status_code=None):
-        is_online = 1 if (status_code and (200 <= status_code < 500 or status_code == 431)) else 0
+        is_online = 1 if status_code == 200 else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -319,7 +319,7 @@ class CertificateDatabase:
             return []
 
     def update_check(self, domain, status_code, response_time_ms):
-        is_online = 1 if (status_code and (200 <= status_code < 500 or status_code == 431)) else 0
+        is_online = 1 if status_code == 200 else 0
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -587,7 +587,7 @@ def load_subdomains_from_file():
             loaded += 1
 
             status_str = str(status_code) if status_code else "timeout"
-            if status_code and (200 <= status_code < 500 or status_code == 431):
+            if status_code == 200:
                 tprint(f"[LOAD] ✅ {db_key} [{status_str}] — en ligne, surveillé")
             else:
                 tprint(f"[LOAD] 🔴 {db_key} [{status_str}] — hors ligne, ajouté au monitoring")
@@ -759,9 +759,9 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
             if base:
                 by_base.setdefault(base, {'accessible': [], 'unreachable': []})
-                # Accessible = 200 ou redirection 3xx
-                # Inaccessible = 4xx, 5xx, timeout (None)
-                if status_code and (200 <= status_code < 500 or status_code == 431):
+                # FIX: Accessible = SEULEMENT 200 OK
+                # Inaccessible = tout le reste (4xx, 5xx, timeout, 3xx, etc)
+                if status_code == 200:
                     by_base[base]['accessible'].append((domain, status_code))
                 else:
                     by_base[base]['unreachable'].append((domain, status_code))
@@ -942,7 +942,7 @@ def cron_recheck_unreachable():
 
                     status_str = str(status_code) if status_code else "timeout"
 
-                    if status_code and (200 <= status_code < 500 or status_code == 431):
+                    if status_code == 200:
                         tprint(f"[CRON] ✅ {domain} [{status_str}]{port_status} — redevenu accessible!")
                         send_now_accessible_alert(domain)
                         db.mark_online(domain, status_code)
