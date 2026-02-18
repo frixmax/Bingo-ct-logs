@@ -445,10 +445,17 @@ AUTH_HTML_PATTERNS = [
     'name="authenticity_token"',
     # Classes/IDs HTML typiques de formulaires login
     'id="login-form"',
+    'id="loginform"',
     'id="loginForm"',
     'id="sign-in-form"',
     'class="login-form"',
+    'class="loginform"',
+    'class="loginForm"',
     'class="signin-form"',
+    # Marqueurs structurels de pages login custom (ex: Vodafone Automotive)
+    # Title qui contient "login" (insensible à la casse via body_low)
+    '- login</title>',
+    'login</title>',
     # Keycloak
     'kc-form-login',
     '/auth/realms/',
@@ -504,6 +511,13 @@ def is_auth_page(body: str) -> tuple:
     # 4. SPA payment/3DS (Vodacom pattern) — postMessage 3DS sans contenu réel
     if 'postmessage' in body_low and ('3ds' in body_low or 'payment' in body_low or '3ds_status' in body_low):
         return (True, "spa_payment: postMessage 3DS/payment detected")
+
+    # 5. Marqueur applicatif custom : id="currentpage" dont la valeur est "login"
+    #    ex: <div id="currentpage" style="display:none">login</div>
+    currentpage_vals = re.findall(r'id=["\']currentpage["\'][^>]*>([^<]+)<', body_low)
+    for val in currentpage_vals:
+        if val.strip() == 'login':
+            return (True, "custom_login_page: id='currentpage' value='login'")
 
     return (False, None)
 
