@@ -6,12 +6,12 @@ services:
     container_name: certstream-monitor
     restart: unless-stopped
     volumes:
-      # Volume persistant pour la base de données SQLite
+      # Volume persistant pour la base de données SQLite et positions CT
       - ct-data:/app/data
-      # Fichiers de configuration en lecture seule
+      # Fichiers de configuration depuis le repo — lecture seule
       - ./domains.txt:/app/domains.txt:ro
-      - ./subdomains.txt:/app/data/subdomains.txt:ro
-      - ./paths.txt:/app/data/paths.txt:ro
+      - ./subdomains.txt:/app/subdomains.txt:ro
+      - ./paths.txt:/app/paths.txt:ro
     environment:
       - TZ=UTC
       - DISCORD_WEBHOOK=${DISCORD_WEBHOOK}
