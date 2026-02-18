@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION AMÉLIORÉE v2
-1. Découvrir sous-domaines via CT Logs (28)
-2. Check status code HTTP/HTTPS (avec suivi redirections)
-3. Envoyer TOUS résultats à Discord
-4. Parser et extraire NON-200 seulement
-5. Stocker en DB SQLite (pool de connexions)
-6. Cron job (5min) - Recheck + alerte si 200
-
-AMÉLIORATIONS v2:
-- Semaphore global pour limiter les connexions HTTP simultanées
-- Purge automatique de check_history (rétention 7 jours)
-- Discord alerts via queue asynchrone (non-bloquant)
-- cleanup_db() entièrement en SQL (pas d'allocation mémoire)
-- dump_db() paginé avec fetchmany()
-- NOTIFICATION_TTL réduit à 1h (au lieu de 6h)
-- Fallback body strip() avant startswith() pour BOM/espaces
-- Cache hash amélioré avec SHA1 tronqué (moins de collisions)
+CT Monitoring VPS - VERSION v3
+Améliorations v3 :
+- Session requests par thread (pool TCP réutilisé, pas de reconnexion à chaque check)
+- Pool HTTP dédié : check_domain() soumis via ThreadPoolExecutor HTTP séparé
+- get_all_domains() paginé (fetchmany) dans path_monitor.check_all()
+- Connexions SQLite fermées proprement en fin de thread (threading.local + weakref finalizer)
+- seen_in_cycle partagé entre logs via un set global protégé par lock
+- Discord queue : log explicite + compteur de pertes si queue pleine
 """
 
 import requests
@@ -31,25 +22,25 @@ import sqlite3
 import hashlib
 import urllib3
 import queue
+import weakref
 from datetime import datetime
 from urllib.parse import urlparse
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from collections import OrderedDict
 
-# Thread-safe print — défini en premier car utilisé dès le démarrage
+# Thread-safe print
 _print_lock = threading.Lock()
 
 def tprint(msg):
     with _print_lock:
         print(msg)
 
-# Supprimer les warnings SSL (verify=False intentionnel)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 tprint("=" * 80)
-tprint("CT MONITORING - VERSION AMÉLIORÉE v2")
+tprint("CT MONITORING - VERSION v3")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 tprint("=" * 80)
 
@@ -64,7 +55,6 @@ PATHS_FILE         = '/app/paths.txt'
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# PARAMETRES
 CHECK_INTERVAL               = 30
 BATCH_SIZE                   = 500
 MAX_BATCHES_CRITICAL         = 200
@@ -75,22 +65,20 @@ CACHE_MAX_SIZE               = 500000
 TIMEOUT_PER_LOG              = 300
 HTTP_CHECK_TIMEOUT           = 5
 PATH_CHECK_TIMEOUT           = 3
-UNREACHABLE_RECHECK_INTERVAL = 300  # 5 minutes
+UNREACHABLE_RECHECK_INTERVAL = 300
 
-# AMÉLIORATION 1 : Semaphore global pour limiter les connexions HTTP simultanées
-# 28 logs en parallèle × N domaines chacun = saturation possible sur petit container
-# On limite à 50 connexions HTTP simultanées toutes origines confondues
+# AMÉLIORATION 1 : Semaphore global HTTP (v2) — conservé
 HTTP_CONCURRENCY_LIMIT = 50
 _http_semaphore = threading.Semaphore(HTTP_CONCURRENCY_LIMIT)
 
-# AMÉLIORATION 6 : NOTIFICATION_TTL réduit à 1h (était 6h)
-# Si un domaine devient accessible 1h après découverte, la redécouverte est notifiée
-NOTIFICATION_TTL = 1 * 3600  # 1 heure au lieu de 6 heures
+# AMÉLIORATION 2 (v3) : Pool HTTP dédié pour check_domain()
+# Les 28 threads monitor_log() ne bloquent plus sur les timeouts HTTP :
+# ils soumettent un Future et continuent le parsing.
+HTTP_WORKER_POOL = ThreadPoolExecutor(max_workers=HTTP_CONCURRENCY_LIMIT, thread_name_prefix="HTTPWorker")
 
-# Rétention historique check_history
+NOTIFICATION_TTL             = 1 * 3600   # 1h
 CHECK_HISTORY_RETENTION_DAYS = 7
 
-# CT LOGS (28 actifs)
 CT_LOGS = [
     {"name": "Google Argon2026h1",     "url": "https://ct.googleapis.com/logs/us1/argon2026h1",  "enabled": True, "priority": "CRITICAL"},
     {"name": "Google Argon2026h2",     "url": "https://ct.googleapis.com/logs/us1/argon2026h2",  "enabled": True, "priority": "CRITICAL"},
@@ -127,20 +115,21 @@ NB_LOGS_ACTIFS = len(ENABLED_LOGS)
 
 # ==================== STATS ====================
 stats = {
-    'certificats_analysés':  0,
-    'alertes_envoyées':      0,
-    'dernière_alerte':       None,
-    'démarrage':             datetime.utcnow(),
-    'dernière_vérification': None,
-    'positions':             {},
-    'logs_actifs':           NB_LOGS_ACTIFS,
-    'duplicates_évités':     0,
-    'parse_errors':          0,
-    'matches_trouvés':       0,
-    'http_checks':           0,
-    'batches_processed':     0,
-    'x509_count':            0,
-    'precert_count':         0,
+    'certificats_analysés':   0,
+    'alertes_envoyées':       0,
+    'dernière_alerte':        None,
+    'démarrage':              datetime.utcnow(),
+    'dernière_vérification':  None,
+    'positions':              {},
+    'logs_actifs':            NB_LOGS_ACTIFS,
+    'duplicates_évités':      0,
+    'parse_errors':           0,
+    'matches_trouvés':        0,
+    'http_checks':            0,
+    'batches_processed':      0,
+    'x509_count':             0,
+    'precert_count':          0,
+    'discord_dropped':        0,   # compteur pertes Discord queue
 }
 stats_lock = threading.Lock()
 
@@ -169,6 +158,25 @@ class LRUCache:
 
 seen_certificates = LRUCache(CACHE_MAX_SIZE)
 
+# ==================== seen_in_cycle GLOBAL (v3) ====================
+# Partagé entre les 28 threads monitor_log() pour éviter de checker
+# le même domaine depuis deux logs différents simultanément.
+_seen_cycle_lock   = threading.Lock()
+_seen_cycle_global = set()
+
+def cycle_seen(domain: str) -> bool:
+    """Retourne True si déjà vu ce cycle, sinon l'ajoute et retourne False."""
+    with _seen_cycle_lock:
+        if domain in _seen_cycle_global:
+            return True
+        _seen_cycle_global.add(domain)
+        return False
+
+def cycle_reset():
+    """Réinitialise le set global en début de cycle principal."""
+    with _seen_cycle_lock:
+        _seen_cycle_global.clear()
+
 # ==================== CACHE NOTIFICATIONS ====================
 class NotificationCache:
     def __init__(self, ttl_seconds=3600):
@@ -196,23 +204,18 @@ class NotificationCache:
                 del self.cache[d]
             return len(expired)
 
-# AMÉLIORATION 6 appliquée : TTL = 1h
 notif_cache = NotificationCache(ttl_seconds=NOTIFICATION_TTL)
 
-# ==================== AMÉLIORATION 3 : Discord Queue asynchrone ====================
-# send_discovery_alert() faisait un POST Discord synchrone depuis les threads monitor_log().
-# Si Discord est lent/down → bloque 10s × 28 threads.
-# Solution : queue + thread dédié qui consomme les payloads Discord.
-
+# ==================== DISCORD QUEUE (v2 + v3 amélioré) ====================
+# v3 : log explicite + compteur stats['discord_dropped'] si queue pleine
 _discord_queue = queue.Queue(maxsize=500)
 
 def _discord_worker():
-    """Thread dédié à l'envoi Discord — non-bloquant pour les threads CT."""
     while True:
         try:
             payload = _discord_queue.get(timeout=5)
             if payload is None:
-                break  # signal d'arrêt
+                break
             if not DISCORD_WEBHOOK:
                 _discord_queue.task_done()
                 continue
@@ -228,27 +231,71 @@ def _discord_worker():
             tprint(f"[DISCORD WORKER FATAL] {e}")
 
 def discord_send(payload: dict):
-    """Enqueue un payload Discord — retour immédiat, jamais bloquant."""
+    """Enqueue Discord — non-bloquant. Log + compteur si queue pleine."""
     try:
         _discord_queue.put_nowait(payload)
     except queue.Full:
-        tprint("[DISCORD QUEUE] Queue pleine — payload Discord ignoré")
+        with stats_lock:
+            stats['discord_dropped'] += 1
+        tprint(f"[DISCORD QUEUE] ⚠️  Queue pleine — payload ignoré (total perdu: {stats['discord_dropped']})")
 
 _discord_thread = threading.Thread(target=_discord_worker, daemon=True, name="DiscordWorker")
 _discord_thread.start()
 
+# ==================== SESSION HTTP PAR THREAD (v3) ====================
+# requests.Session réutilise les connexions TCP (keep-alive).
+# Chaque thread du pool HTTP possède sa propre Session → pas de contention.
+_session_local = threading.local()
+
+def get_session() -> requests.Session:
+    """Retourne la Session du thread courant, en la créant si nécessaire."""
+    if not hasattr(_session_local, 'session') or _session_local.session is None:
+        s = requests.Session()
+        # Pool de connexions par Session : jusqu'à 10 connexions vers le même host
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=0,
+        )
+        s.mount('https://', adapter)
+        s.mount('http://', adapter)
+        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        s.verify = False
+        _session_local.session = s
+    return _session_local.session
+
 # ==================== DATABASE ====================
 class CertificateDatabase:
+    """
+    v3 : connexions SQLite fermées proprement via un finalizer weakref
+    sur l'objet threading.local — évite les connexions orphelines quand
+    un thread du pool est détruit après un long uptime.
+    """
+
     def __init__(self, db_path):
         self.db_path = db_path
         self._local  = threading.local()
+        self._conns  = []           # liste faible pour tracking (debug)
+        self._conns_lock = threading.Lock()
         self.init_db()
 
     def _get_conn(self):
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._local.conn.execute('PRAGMA journal_mode=WAL')
-            self._local.conn.execute('PRAGMA synchronous=NORMAL')
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            self._local.conn = conn
+
+            # Finalizer : ferme la connexion quand le threading.local est GC
+            local_ref = weakref.ref(self._local)
+            def _close_conn(conn=conn, ref=local_ref):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            # Attache le finalizer sur l'objet local lui-même
+            weakref.finalize(self._local, _close_conn)
+
         return self._local.conn
 
     def get_conn(self):
@@ -290,7 +337,6 @@ class CertificateDatabase:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain     ON subdomains(domain)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_check ON subdomains(last_check)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_online  ON subdomains(is_online)')
-        # Index sur check_history pour accélérer la purge
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_ts ON check_history(check_timestamp)')
         conn.commit()
         tprint(f"[DB] Initialisée: {self.db_path}")
@@ -369,15 +415,33 @@ class CertificateDatabase:
         except Exception:
             return 0
 
+    def iter_all_domains(self, page_size=500):
+        """
+        AMÉLIORATION v3 : générateur paginé — remplace get_all_domains() (fetchall).
+        Consomme une mémoire constante quelle que soit la taille de la DB.
+        """
+        offset = 0
+        while True:
+            try:
+                conn   = self._get_conn()
+                cursor = conn.cursor()
+                cursor.execute(
+                    'SELECT domain FROM subdomains ORDER BY domain LIMIT ? OFFSET ?',
+                    (page_size, offset)
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+                for (domain,) in rows:
+                    yield domain
+                offset += page_size
+            except Exception as e:
+                tprint(f"[DB ERROR] iter_all_domains: {e}")
+                break
+
     def get_all_domains(self):
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute('SELECT domain FROM subdomains ORDER BY domain')
-            return [row[0] for row in cursor.fetchall()]
-        except Exception as e:
-            tprint(f"[DB ERROR] get_all_domains: {e}")
-            return []
+        """Conservé pour compatibilité — utilise iter_all_domains en interne."""
+        return list(self.iter_all_domains())
 
     def update_check(self, domain, status_code, response_time_ms):
         is_online = 1 if status_code == 200 else 0
@@ -411,9 +475,7 @@ class CertificateDatabase:
         except Exception as e:
             tprint(f"[DB ERROR] mark_online {domain}: {e}")
 
-    # AMÉLIORATION 2 : Purge automatique de check_history
     def purge_history(self, retention_days=CHECK_HISTORY_RETENTION_DAYS):
-        """Supprime les entrées check_history plus vieilles que retention_days jours."""
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -441,8 +503,7 @@ class CertificateDatabase:
 
     def size_mb(self):
         try:
-            size = os.path.getsize(self.db_path)
-            return round(size / 1024 / 1024, 2)
+            return round(os.path.getsize(self.db_path) / 1024 / 1024, 2)
         except Exception:
             return 0
 
@@ -461,11 +522,11 @@ class CertificateDatabase:
             ''')
             row = cursor.fetchone()
             return {
-                'total':  row[0],
-                'online': row[1],
+                'total':   row[0],
+                'online':  row[1],
                 'timeout': row[2],
-                '4xx':    row[3],
-                '5xx':    row[4],
+                '4xx':     row[3],
+                '5xx':     row[4],
             }
         except Exception:
             return {'total': 0, 'online': 0, 'timeout': 0, '4xx': 0, '5xx': 0}
@@ -491,84 +552,152 @@ PATH_CONTENT_EXPECTATIONS = {
     'phpmyadmin':       ['phpMyAdmin', 'pma_', 'PMA_'],
 }
 
-
 def check_content_coherence(body: str, path: str) -> tuple:
     path_low    = path.lower()
     body_sample = body[:5000]
-
     for pattern, keywords in PATH_CONTENT_EXPECTATIONS.items():
         if pattern in path_low:
             found = [kw for kw in keywords if kw.lower() in body_sample.lower()]
             if not found:
                 return (False, f"path '{pattern}' expects {keywords[:3]}... none found in body")
             return (True, f"found keywords: {found[:2]}")
-
     return (True, "no_rule_for_path")
-
 
 # ==================== WAF DETECTION ====================
 WAF_BLOCK_BODY_SIGNATURES = [
-    'you have been blocked',
-    'this request has been blocked',
-    'access denied',
-    'your access to this site has been limited',
-    'sorry, you have been blocked',
-    '__cf_chl_opt',
-    'cf-please-wait',
-    'checking your browser before accessing',
-    'sucuri website firewall - access denied',
-    'incapsula incident id',
-    '_incapsula_resource',
-    'incapsula_error',
-    'mod_security',
-    'request rejected',
-    'forbidden by policy',
-    'security policy violation',
-    'NotFoundException',
-    'not found',
-    'endpoint not found',
-    'resource not found',
+    'you have been blocked', 'this request has been blocked', 'access denied',
+    'your access to this site has been limited', 'sorry, you have been blocked',
+    '__cf_chl_opt', 'cf-please-wait', 'checking your browser before accessing',
+    'sucuri website firewall - access denied', 'incapsula incident id',
+    '_incapsula_resource', 'incapsula_error', 'mod_security', 'request rejected',
+    'forbidden by policy', 'security policy violation', 'NotFoundException',
+    'not found', 'endpoint not found', 'resource not found',
 ]
-
 
 def is_waf_block(response) -> tuple:
     headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
-
     if 'text/html' not in content_type:
         return (False, None)
-
     try:
         body     = response.text[:8000]
         is_short = len(body) < 2000
         body_low = body.lower()
-
         for sig in WAF_BLOCK_BODY_SIGNATURES:
             if sig.lower() in body_low:
                 return (True, f"waf_block: '{sig}'")
-
         if is_short and 'cloudflare' in body_low and ('challenge' in body_low or 'captcha' in body_low):
             return (True, "waf_block: cloudflare challenge")
-
         if is_short and '_incapsula_resource' in body_low and 'noindex' in body_low:
             return (True, "waf_block: incapsula")
-
     except Exception:
         pass
-
     return (False, None)
 
+# ==================== HTTP CHECKER ====================
+def _do_check_domain(domain: str) -> tuple:
+    """
+    Exécuté dans un thread du HTTP_WORKER_POOL.
+    Utilise la Session du thread courant (keep-alive, pool TCP).
+    """
+    MAX_REDIRECTS = 5
+    session = get_session()
+
+    for protocol in ['https', 'http']:
+        try:
+            with _http_semaphore:
+                start    = time.time()
+                response = session.get(
+                    f"{protocol}://{domain}",
+                    timeout=HTTP_CHECK_TIMEOUT,
+                    allow_redirects=True,
+                    stream=False
+                )
+            elapsed = int((time.time() - start) * 1000)
+
+            requested_url = f"{protocol}://{domain}"
+            if response.url != requested_url and response.url.lower() != f"{protocol}://{domain.lower()}/":
+                if len(response.history) > MAX_REDIRECTS:
+                    return (403, elapsed)
+                original_domain = urlparse(requested_url).netloc
+                redirect_domain = urlparse(response.url).netloc
+                if original_domain.lower() != redirect_domain.lower():
+                    tprint(f"[REDIRECT_DOMAIN] {domain} → {redirect_domain}")
+                    return (403, elapsed)
+                tprint(f"[REDIRECT] {domain} → {response.url}")
+
+            if response.status_code == 200:
+                content_type = response.headers.get('Content-Type', '').lower()
+                if content_type and 'text/html' not in content_type and 'application/json' not in content_type:
+                    return (403, elapsed)
+                waf, reason = is_waf_block(response)
+                if waf:
+                    tprint(f"[WAF] {domain} → 200 bloqué ({reason})")
+                    return (403, elapsed)
+                return (200, elapsed)
+            elif response.status_code == 403:
+                return (403, elapsed)
+            return (response.status_code, elapsed)
+
+        except Exception:
+            continue
+    return (None, None)
+
+
+def check_domain(domain: str) -> tuple:
+    """
+    AMÉLIORATION v3 : soumet le check dans HTTP_WORKER_POOL et attend le résultat.
+    Les threads monitor_log() ne font plus eux-mêmes les requêtes HTTP —
+    ils délèguent au pool dédié et bloquent uniquement sur le Future.result().
+    Cela isole les timeouts HTTP du parsing CT et permet une meilleure
+    utilisation des Sessions keep-alive.
+    """
+    future = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
+    try:
+        return future.result(timeout=HTTP_CHECK_TIMEOUT + 2)
+    except Exception:
+        return (None, None)
+
+
+def check_port(host, port, timeout=10):
+    try:
+        start   = time.time()
+        sock    = socket.create_connection((host, port), timeout=timeout)
+        elapsed = int((time.time() - start) * 1000)
+        sock.close()
+        return (True, elapsed)
+    except Exception:
+        return (False, None)
+
+
+def parse_subdomain_entry(entry):
+    entry = entry.strip().lower()
+    if ':' in entry:
+        parts = entry.rsplit(':', 1)
+        try:
+            return (parts[0], int(parts[1]))
+        except ValueError:
+            return (entry, None)
+    return (entry, None)
+
+# ==================== CHARGEMENT DOMAINES CIBLES ====================
+try:
+    with open(DOMAINS_FILE, 'r') as f:
+        targets = {line.strip().lower() for line in f if line.strip() and not line.startswith('#')}
+    tprint(f"[OK] {len(targets)} domaines chargés")
+except Exception as e:
+    tprint(f"[ERREUR] Chargement domaines: {e}")
+    targets = set()
+
+if not targets:
+    tprint("[ERREUR] Aucun domaine à surveiller — arrêt.")
+    exit(1)
 
 # ==================== PATH MONITOR ====================
 class PathMonitor:
     DEFAULT_PATHS = [
-        "/.env",
-        "/.env.backup",
-        "/.git/config",
-        "/wp-config.php",
-        "/actuator/env",
-        "/api/v1/users",
-        "/backup.sql",
+        "/.env", "/.env.backup", "/.git/config", "/wp-config.php",
+        "/actuator/env", "/api/v1/users", "/backup.sql",
     ]
 
     def __init__(self, paths_file):
@@ -578,7 +707,7 @@ class PathMonitor:
 
     def load_paths(self):
         if not os.path.exists(self.paths_file):
-            tprint(f"[PATHS] {self.paths_file} absent — utilisation des {len(self.paths)} paths par defaut")
+            tprint(f"[PATHS] {self.paths_file} absent — {len(self.paths)} paths par defaut")
             return
         try:
             with open(self.paths_file, 'r') as f:
@@ -586,29 +715,21 @@ class PathMonitor:
             for p in custom:
                 if p not in self.paths:
                     self.paths.append(p)
-            tprint(f"[PATHS] {len(self.DEFAULT_PATHS)} paths par defaut + {len(custom)} custom = {len(self.paths)} total")
+            tprint(f"[PATHS] {len(self.DEFAULT_PATHS)} defaut + {len(custom)} custom = {len(self.paths)} total")
         except Exception as e:
             tprint(f"[PATHS ERROR] {e}")
 
     def check_path(self, url: str) -> tuple:
-        """
-        Vérifie si un path sensible est accessible et retourne du vrai contenu.
-
-        AMÉLIORATION 7 : strip() + lstrip(BOM) avant startswith() pour éviter
-        les faux négatifs quand le body commence par un BOM (\\xef\\xbb\\xbf)
-        ou des espaces/newlines avant <!DOCTYPE.
-        """
         MAX_CONTENT_SIZE = 5 * 1024 * 1024
         parsed_path      = urlparse(url).path
+        session          = get_session()
 
         try:
-            with _http_semaphore:  # AMÉLIORATION 1 : acquérir le slot
-                response      = requests.get(
+            with _http_semaphore:
+                response = session.get(
                     url,
                     timeout=PATH_CHECK_TIMEOUT,
-                    verify=False,
                     allow_redirects=True,
-                    headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
                     stream=True
                 )
             response_time = int(response.elapsed.total_seconds() * 1000)
@@ -618,8 +739,7 @@ class PathMonitor:
 
                 if 'text/html' in content_type:
                     response.close()
-                    tprint(f"[PATHS FP] {url} → Content-Type HTML rejeté")
-                    return (403, None, response_time, "HTML content-type: not a sensitive file")
+                    return (403, None, response_time, "HTML content-type")
 
                 if content_type and 'application/json' not in content_type \
                         and 'text/plain' not in content_type \
@@ -632,7 +752,7 @@ class PathMonitor:
                     size = int(response.headers.get('Content-Length', '0'))
                     if size > MAX_CONTENT_SIZE:
                         response.close()
-                        return (403, None, response_time, f"Content too large ({size} bytes)")
+                        return (403, None, response_time, f"Content too large ({size})")
                 except Exception:
                     pass
 
@@ -645,7 +765,6 @@ class PathMonitor:
                         chunks.append(chunk)
                         total += len(chunk)
                         if total >= MAX_CONTENT_SIZE:
-                            tprint(f"[PATHS WARN] {url} → Body tronqué à {MAX_CONTENT_SIZE} bytes")
                             break
                     content = ''.join(chunks)
                     response.close()
@@ -656,18 +775,13 @@ class PathMonitor:
                 if not content or len(content) <= 200:
                     return (403, None, response_time, f"Content too small ({len(content)} bytes)")
 
-                # AMÉLIORATION 7 : strip BOM UTF-8 (0xEF 0xBB 0xBF encodé) + whitespace
-                # avant de tester si le body est du HTML.
-                # Sans ça, un fichier commençant par "\xef\xbb\xbf<!DOCTYPE" ou " <!DOCTYPE"
-                # passait le filtre et générait un faux positif.
+                # BOM + whitespace strip (v2)
                 body_start = content.lstrip('\ufeff').lstrip()[:200].lower()
                 if body_start.startswith('<!doctype') or body_start.startswith('<html'):
-                    tprint(f"[PATHS FP] {url} → Body HTML détecté (pas de Content-Type)")
-                    return (403, None, response_time, "HTML body: not a sensitive file")
+                    return (403, None, response_time, "HTML body")
 
                 is_coherent, coherence_reason = check_content_coherence(content, parsed_path)
                 if not is_coherent:
-                    tprint(f"[PATHS FP] {url} → Contenu incohérent: {coherence_reason}")
                     return (403, None, response_time, f"Content mismatch: {coherence_reason}")
 
                 return (200, content, response_time, None)
@@ -678,35 +792,29 @@ class PathMonitor:
             return (response.status_code, None, response_time, None)
 
         except requests.exceptions.Timeout:
-            tprint(f"[PATHS WARN] {url} → Timeout")
             return (None, None, PATH_CHECK_TIMEOUT * 1000, "Timeout")
         except Exception as e:
-            tprint(f"[PATHS ERROR] {url} → {str(e)[:100]}")
-            return (None, None, None, str(e))
-
-    def _send_embed(self, embed):
-        """Utilise la queue Discord — non-bloquant."""
-        discord_send({"embeds": [embed]})
+            return (None, None, None, str(e)[:100])
 
     def send_content_alert(self, url, content):
         preview = content[:1900]
         if len(content) > 1900:
-            preview += f"\n... (tronque, taille totale: {len(content)} chars)"
+            preview += f"\n... (tronque, taille: {len(content)} chars)"
         embed = {
             "title":       "✅ Fichier sensible accessible",
             "description": f"`{url}`\n\n```\n{preview}\n```",
             "color":       0x00ff00,
             "fields": [
-                {"name": "Taille",  "value": f"{len(content)} bytes", "inline": True},
-                {"name": "Status",  "value": "200 OK",                "inline": True},
+                {"name": "Taille", "value": f"{len(content)} bytes", "inline": True},
+                {"name": "Status", "value": "200 OK",                "inline": True},
             ],
             "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
         }
-        self._send_embed(embed)
+        discord_send({"embeds": [embed]})
         tprint(f"[PATHS ALERT] Fichier sensible: {url}")
 
-    def check_domain(self, domain):
+    def check_domain_paths(self, domain):
         host, port = parse_subdomain_entry(domain)
         found = errors = checked = 0
         for path in self.paths:
@@ -726,64 +834,60 @@ class PathMonitor:
                     break
         return found, checked, errors
 
-    def check_domain_worker(self, domain):
-        try:
-            return self.check_domain(domain)
-        except Exception as e:
-            tprint(f"[PATHS ERROR] check_domain_worker {domain}: {e}")
-            return 0, 0, 0
-
     def check_all(self):
-        all_domains = db.get_all_domains()
-        if not all_domains:
-            tprint("[PATHS CRON] Aucun domaine en DB")
-            return
-
-        total_requests = len(self.paths) * len(all_domains)
-        tprint(f"[PATHS CRON] Debut scan — {len(all_domains)} domaines x {len(self.paths)} paths = {total_requests} requetes max")
-
+        """
+        AMÉLIORATION v3 : utilise iter_all_domains() paginé au lieu de get_all_domains().
+        Les domaines sont soumis au pool par lots → mémoire constante.
+        """
         total_found = total_checked = total_errors = 0
+        domain_count = 0
         start = time.time()
 
         MAX_WORKERS = 50
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures   = {executor.submit(self.check_domain_worker, domain): domain for domain in all_domains}
-            completed = 0
-            for future in as_completed(futures):
-                domain = futures[future]
+        SUBMIT_BATCH = 200  # on soumet 200 domaines à la fois au pool
+
+        tprint(f"[PATHS CRON] Debut scan ({len(self.paths)} paths/domaine)...")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="PathCheck") as executor:
+            batch_futures = {}
+
+            for domain in db.iter_all_domains(page_size=SUBMIT_BATCH):
+                domain_count += 1
+                future = executor.submit(self.check_domain_paths, domain)
+                batch_futures[future] = domain
+
+                # Récolter les résultats au fil de l'eau pour ne pas accumuler trop de Futures
+                if len(batch_futures) >= SUBMIT_BATCH:
+                    done_futures = [f for f in batch_futures if f.done()]
+                    for f in done_futures:
+                        try:
+                            found, checked, errors = f.result()
+                            total_found   += found
+                            total_checked += checked
+                            total_errors  += errors
+                        except Exception as e:
+                            tprint(f"[PATHS ERROR] {batch_futures[f]}: {str(e)[:80]}")
+                        del batch_futures[f]
+
+            # Récolter le reste
+            for future in as_completed(batch_futures):
                 try:
                     found, checked, errors = future.result()
                     total_found   += found
                     total_checked += checked
                     total_errors  += errors
-                    completed     += 1
-                    if completed % 50 == 0:
-                        tprint(f"[PATHS CRON] Progression: {completed}/{len(all_domains)} domaines scannés...")
                 except Exception as e:
-                    tprint(f"[PATHS CRON ERROR] {domain}: {str(e)[:100]}")
+                    tprint(f"[PATHS ERROR] {batch_futures[future]}: {str(e)[:80]}")
 
         elapsed = int(time.time() - start)
-        tprint(f"[PATHS CRON] Scan terminé en {elapsed}s")
-        tprint(f"[PATHS CRON] Requetes: {total_checked} effectuées | {total_errors} erreurs réseau")
+        tprint(f"[PATHS CRON] Scan terminé — {domain_count} domaines en {elapsed}s")
+        tprint(f"[PATHS CRON] Requetes: {total_checked} | erreurs: {total_errors}")
         if total_found > 0:
             tprint(f"[PATHS CRON] ⚠️  {total_found} fichier(s) sensible(s) trouvé(s) !")
         else:
             tprint(f"[PATHS CRON] ✅ Aucun fichier sensible trouvé")
 
 path_monitor = PathMonitor(PATHS_FILE)
-
-# ==================== CHARGEMENT DOMAINES CIBLES ====================
-try:
-    with open(DOMAINS_FILE, 'r') as f:
-        targets = {line.strip().lower() for line in f if line.strip() and not line.startswith('#')}
-    tprint(f"[OK] {len(targets)} domaines chargés")
-except Exception as e:
-    tprint(f"[ERREUR] Chargement domaines: {e}")
-    targets = set()
-
-if not targets:
-    tprint("[ERREUR] Aucun domaine à surveiller — arrêt.")
-    exit(1)
 
 # ==================== PERSISTANCE POSITIONS ====================
 def load_positions():
@@ -812,83 +916,6 @@ def save_positions():
 
 stats['positions'] = load_positions()
 
-# ==================== HTTP CHECKER ====================
-def check_domain(domain):
-    """
-    Vérifie HTTP/HTTPS avec suivi des redirections.
-    AMÉLIORATION 1 : acquiert le semaphore global avant chaque requête.
-    """
-    MAX_REDIRECTS = 5
-
-    for protocol in ['https', 'http']:
-        try:
-            with _http_semaphore:  # limite les connexions simultanées
-                start    = time.time()
-                response = requests.get(
-                    f"{protocol}://{domain}",
-                    timeout=HTTP_CHECK_TIMEOUT,
-                    allow_redirects=True,
-                    verify=False,
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-                    stream=False
-                )
-            elapsed = int((time.time() - start) * 1000)
-
-            requested_url = f"{protocol}://{domain}"
-            if response.url != requested_url and response.url.lower() != f"{protocol}://{domain.lower()}/":
-                if len(response.history) > MAX_REDIRECTS:
-                    tprint(f"[REDIRECT_LIMIT] {domain} → Trop de redirections ({len(response.history)})")
-                    return (403, elapsed)
-                original_domain = urlparse(requested_url).netloc
-                redirect_domain = urlparse(response.url).netloc
-                if original_domain.lower() != redirect_domain.lower():
-                    tprint(f"[REDIRECT_DOMAIN] {domain} → {redirect_domain} (domaine différent)")
-                    return (403, elapsed)
-                tprint(f"[REDIRECT] {domain} → {response.url}")
-
-            if response.status_code == 200:
-                content_type = response.headers.get('Content-Type', '').lower()
-                if content_type and 'text/html' not in content_type and 'application/json' not in content_type:
-                    tprint(f"[CONTENT_TYPE] {domain} → {response.headers.get('Content-Type')} (non-HTML/JSON)")
-                    return (403, elapsed)
-                waf, reason = is_waf_block(response)
-                if waf:
-                    tprint(f"[WAF] {domain} → 200 bloqué ({reason})")
-                    return (403, elapsed)
-                return (200, elapsed)
-
-            elif response.status_code == 403:
-                return (403, elapsed)
-
-            return (response.status_code, elapsed)
-
-        except Exception:
-            continue
-    return (None, None)
-
-
-def check_port(host, port, timeout=10):
-    try:
-        start   = time.time()
-        sock    = socket.create_connection((host, port), timeout=timeout)
-        elapsed = int((time.time() - start) * 1000)
-        sock.close()
-        return (True, elapsed)
-    except Exception:
-        return (False, None)
-
-
-def parse_subdomain_entry(entry):
-    entry = entry.strip().lower()
-    if ':' in entry:
-        parts = entry.rsplit(':', 1)
-        try:
-            port = int(parts[1])
-            return (parts[0], port)
-        except ValueError:
-            return (entry, None)
-    return (entry, None)
-
 # ==================== CHARGEMENT SUBDOMAINS MANUELS ====================
 def load_subdomains_from_file():
     loaded = duplicates = 0
@@ -898,48 +925,37 @@ def load_subdomains_from_file():
     try:
         with open(SUBDOMAINS_FILE, 'r') as f:
             subdomains = [l.strip().lower() for l in f if l.strip() and not l.startswith('#')]
-
         tprint(f"[LOAD] {len(subdomains)} sous-domaines dans {SUBDOMAINS_FILE}")
 
         for entry in subdomains:
             subdomain, port = parse_subdomain_entry(entry)
-            db_key          = entry
-            base_domain     = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
+            db_key      = entry
+            base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
 
             if db.subdomain_exists(db_key):
                 duplicates += 1
-                tprint(f"[LOAD] ⏭️  Déjà en DB: {db_key}")
                 continue
 
             tprint(f"[LOAD] 🔍 Check initial: {subdomain} ...")
             status_code, response_time = check_domain(subdomain)
 
             if port:
-                port_open, port_time = check_port(subdomain, port)
+                port_open, _ = check_port(subdomain, port)
                 tprint(f"[LOAD] 🔌 {subdomain}:{port} — port {'ouvert' if port_open else 'fermé'}")
 
             db.add_subdomain_from_file(db_key, base_domain, status_code)
             loaded += 1
-
             status_str = str(status_code) if status_code else "timeout"
-            if status_code == 200:
-                tprint(f"[LOAD] ✅ {db_key} [{status_str}] — en ligne, surveillé")
-            else:
-                tprint(f"[LOAD] 🔴 {db_key} [{status_str}] — hors ligne, ajouté au monitoring")
+            tprint(f"[LOAD] {'✅' if status_code == 200 else '🔴'} {db_key} [{status_str}]")
 
         tprint(f"[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB")
         return loaded, duplicates
-
     except Exception as e:
         tprint(f"[ERROR] Chargement subdomains: {e}")
         return 0, 0
 
 # ==================== DISCORD ALERTS ====================
 def send_discovery_alert(matched_domains_with_status, log_name):
-    """
-    AMÉLIORATION 3 : utilise discord_send() (queue) au lieu de requests.post() direct.
-    Retour immédiat — ne bloque plus les threads monitor_log().
-    """
     try:
         if not matched_domains_with_status:
             return
@@ -954,8 +970,7 @@ def send_discovery_alert(matched_domains_with_status, log_name):
                 notif_cache.mark(domain)
 
         if skipped > 0:
-            tprint(f"[DISCORD] {skipped} domaine(s) ignores - deja notifies recemment")
-
+            tprint(f"[DISCORD] {skipped} domaine(s) ignores - deja notifies")
         if not filtered:
             return
 
@@ -971,7 +986,6 @@ def send_discovery_alert(matched_domains_with_status, log_name):
 
         description      = ""
         total_accessible = total_unreachable = 0
-
         for base, data in sorted(by_base.items()):
             description += f"\n**{base}**\n"
             if data['accessible']:
@@ -997,15 +1011,13 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
         }
-
-        discord_send({"embeds": [embed]})  # non-bloquant
+        discord_send({"embeds": [embed]})
 
         with stats_lock:
             stats['alertes_envoyées'] += 1
             stats['dernière_alerte']   = datetime.utcnow()
 
-        tprint(f"[DISCORD] {len(matched_domains_with_status)} découverts (✅{total_accessible} ❌{total_unreachable})")
-
+        tprint(f"[DISCORD] {len(filtered)} notifiés (✅{total_accessible} ❌{total_unreachable})")
     except Exception as e:
         tprint(f"[DISCORD ERROR] send_discovery_alert: {e}")
 
@@ -1018,15 +1030,12 @@ def send_now_accessible_alert(domain):
         "footer":      {"text": "CT Monitor"},
         "timestamp":   datetime.utcnow().isoformat()
     }
-    discord_send({"embeds": [embed]})  # non-bloquant
+    discord_send({"embeds": [embed]})
     tprint(f"[ALERT] {domain} est maintenant accessible!")
 
 # ==================== PARSING CERTIFICATS ====================
 def _cert_hash(leaf_input: str) -> str:
-    """
-    AMÉLIORATION 8 : SHA1 tronqué à 8 bytes hex (16 chars) au lieu de MD5 complet.
-    Moins de collisions théoriques que MD5, taille identique en mémoire.
-    """
+    """SHA1 tronqué — moins de collisions que MD5 (v2)."""
     return hashlib.sha1(leaf_input.encode()).hexdigest()[:16]
 
 
@@ -1041,7 +1050,7 @@ def parse_certificate(entry):
         log_entry_type = int.from_bytes(leaf_bytes[10:12], 'big')
         cert_der       = None
 
-        if log_entry_type == 0:  # X509Entry
+        if log_entry_type == 0:
             with stats_lock:
                 stats['x509_count'] += 1
             if len(leaf_bytes) < 15:
@@ -1051,7 +1060,7 @@ def parse_certificate(entry):
             if cert_end <= len(leaf_bytes):
                 cert_der = leaf_bytes[15:cert_end]
 
-        elif log_entry_type == 1:  # PreCertificate
+        elif log_entry_type == 1:
             with stats_lock:
                 stats['precert_count'] += 1
             try:
@@ -1100,7 +1109,7 @@ def parse_certificate(entry):
             stats['parse_errors'] += 1
         return []
 
-# Flag global pour éviter deux scans PathMonitor en parallèle
+# ==================== FLAG PATH SCAN ====================
 _path_scan_running = threading.Event()
 
 # ==================== CRON JOB - RECHECK ====================
@@ -1112,50 +1121,46 @@ def cron_recheck_unreachable():
         try:
             total_offline = db.count_offline()
             total         = db.count()
-            tprint(f"[CRON] ---- Recheck démarré — {total} domaine(s) en monitoring | {total_offline} offline ----")
+            tprint(f"[CRON] ---- Recheck — {total} domaine(s) | {total_offline} offline ----")
 
             back_online = still_down = 0
 
-            if total_offline == 0:
-                tprint("[CRON] Aucun domaine offline à recheck")
-            else:
+            if total_offline > 0:
                 offset = 0
                 while True:
                     domains = db.get_offline(limit=RECHECK_BATCH, offset=offset)
                     if not domains:
                         break
-
                     for domain, base_domain, last_check in domains:
                         host, port = parse_subdomain_entry(domain)
                         status_code, response_time = check_domain(host)
 
                         port_status = ""
                         if port:
-                            port_open, port_time = check_port(host, port)
+                            port_open, _ = check_port(host, port)
                             port_status = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
                             if port_open and (not status_code or status_code >= 400):
                                 status_code = 200
-                                tprint(f"[CRON] 🔌 {domain} — port {port} ouvert")
-
-                        status_str = str(status_code) if status_code else "timeout"
 
                         if status_code == 200:
-                            tprint(f"[CRON] ✅ {domain} [{status_str}]{port_status} — redevenu accessible!")
+                            tprint(f"[CRON] ✅ {domain} [{status_code}]{port_status} — redevenu accessible!")
                             send_now_accessible_alert(domain)
                             db.mark_online(domain, status_code)
                             back_online += 1
                         else:
                             db.update_check(domain, status_code, response_time)
-                            tprint(f"[CRON] 🔴 {domain} [{status_str}]{port_status} — toujours hors ligne")
+                            tprint(f"[CRON] 🔴 {domain} [{status_code or 'timeout'}]{port_status}")
                             still_down += 1
-
                     offset += RECHECK_BATCH
+            else:
+                tprint("[CRON] Aucun domaine offline à recheck")
 
-            tprint(f"[CRON] Résumé recheck: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
+            tprint(f"[CRON] {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
 
-            # AMÉLIORATION 2 : Purge check_history à chaque cycle cron
+            # Purge historique
             db.purge_history(retention_days=CHECK_HISTORY_RETENTION_DAYS)
 
+            # Scan paths
             if _path_scan_running.is_set():
                 tprint("[CRON] Scan paths ignoré — scan précédent encore en cours")
             else:
@@ -1165,10 +1170,8 @@ def cron_recheck_unreachable():
                         path_monitor.check_all()
                     finally:
                         _path_scan_running.clear()
-
-                paths_thread = threading.Thread(target=_run_path_scan, daemon=True, name="PathScan")
-                paths_thread.start()
-                tprint(f"[CRON] Scan paths lancé en arrière-plan")
+                threading.Thread(target=_run_path_scan, daemon=True, name="PathScan").start()
+                tprint("[CRON] Scan paths lancé en arrière-plan")
 
             tprint(f"[CRON] Prochain recheck dans {UNREACHABLE_RECHECK_INTERVAL}s")
             time.sleep(UNREACHABLE_RECHECK_INTERVAL)
@@ -1207,17 +1210,16 @@ def monitor_log(log_config):
 
     backlog     = tree_size - current_pos
     max_batches = {'CRITICAL': MAX_BATCHES_CRITICAL, 'HIGH': MAX_BATCHES_HIGH}.get(priority, MAX_BATCHES_MEDIUM)
-
-    tprint(f"[{log_name}] Backlog: {backlog:,} entrées — traitement jusqu'à {max_batches * BATCH_SIZE:,}")
+    tprint(f"[{log_name}] Backlog: {backlog:,} — max {max_batches * BATCH_SIZE:,} certs ce cycle")
 
     batches_done  = 0
     all_results   = []
-    seen_in_cycle = set()
+    # Futures HTTP soumis depuis ce thread — récoltés à la fin du batch
+    pending_http: dict[Future, str] = {}
 
     while batches_done < max_batches:
         with stats_lock:
             current_pos = stats['positions'][log_name]
-
         if current_pos >= tree_size:
             break
 
@@ -1240,14 +1242,12 @@ def monitor_log(log_config):
                 stats['certificats_analysés'] += 1
 
             leaf_input = entry.get('leaf_input', '')
-            # AMÉLIORATION 8 : SHA1 tronqué au lieu de MD5
             cert_hash  = _cert_hash(leaf_input)
 
             if seen_certificates.contains(cert_hash):
                 with stats_lock:
                     stats['duplicates_évités'] += 1
                 continue
-
             seen_certificates.add(cert_hash)
 
             matched_domains = parse_certificate(entry)
@@ -1258,24 +1258,35 @@ def monitor_log(log_config):
                 stats['matches_trouvés'] += len(matched_domains)
 
             for domain in matched_domains:
-                if domain in seen_in_cycle:
+                # AMÉLIORATION v3 : seen_in_cycle global partagé entre tous les logs
+                if cycle_seen(domain):
                     continue
-                seen_in_cycle.add(domain)
 
-                status_code, response_time = check_domain(domain)
-                with stats_lock:
-                    stats['http_checks'] += 1
-
-                all_results.append((domain, status_code))
-
-                base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
-                if base:
-                    db.add_domain(domain, base, status_code, log_name)
+                # Soumettre le check HTTP au pool — non-bloquant
+                future = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
+                pending_http[future] = domain
 
         with stats_lock:
             stats['positions'][log_name] = end_pos
             stats['batches_processed']  += 1
         batches_done += 1
+
+    # Récolter tous les Futures HTTP de ce log
+    for future in as_completed(pending_http, timeout=HTTP_CHECK_TIMEOUT + 5):
+        domain = pending_http[future]
+        try:
+            status_code, response_time = future.result()
+        except Exception:
+            status_code, response_time = None, None
+
+        with stats_lock:
+            stats['http_checks'] += 1
+
+        all_results.append((domain, status_code))
+
+        base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
+        if base:
+            db.add_domain(domain, base, status_code, log_name)
 
     if all_results:
         send_discovery_alert(all_results, log_name)
@@ -1285,7 +1296,7 @@ def monitor_log(log_config):
 
 def monitor_all_logs():
     results = {}
-    with ThreadPoolExecutor(max_workers=PARALLEL_LOGS) as executor:
+    with ThreadPoolExecutor(max_workers=PARALLEL_LOGS, thread_name_prefix="CTLog") as executor:
         futures = {executor.submit(monitor_log, log): log['name'] for log in ENABLED_LOGS}
         for future in as_completed(futures):
             log_name = futures[future]
@@ -1298,34 +1309,22 @@ def monitor_all_logs():
 
 # ==================== NETTOYAGE DB ====================
 def cleanup_db():
-    """
-    AMÉLIORATION 4 : entièrement en SQL — plus d'allocation mémoire.
-    La version précédente chargeait tous les domaines avec fetchall() pour
-    trouver les orphelins côté Python. Maintenant une seule requête SQL suffit,
-    même sur 50 000 domaines.
-    """
+    """Entièrement en SQL — zéro allocation mémoire (v2)."""
     try:
         conn   = db.get_conn()
         cursor = conn.cursor()
 
-        # Supprimer les wildcards
         cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
         wildcards_deleted = cursor.rowcount
 
-        # AMÉLIORATION 4 : supprimer les orphelins directement en SQL
-        # On construit la clause WHERE avec les domaines cibles
         if targets:
-            # Conditions : domain = t OR domain LIKE '%.t' pour chaque target
             conditions = []
             params     = []
             for t in targets:
                 conditions.append("domain = ? OR domain LIKE ?")
                 params.extend([t, f'%.{t}'])
-            where_clause  = " OR ".join(f"({c})" for c in conditions)
-            cursor.execute(
-                f"DELETE FROM subdomains WHERE NOT ({where_clause})",
-                params
-            )
+            where_clause = " OR ".join(f"({c})" for c in conditions)
+            cursor.execute(f"DELETE FROM subdomains WHERE NOT ({where_clause})", params)
             orphans_deleted = cursor.rowcount
         else:
             orphans_deleted = 0
@@ -1335,46 +1334,36 @@ def cleanup_db():
         if wildcards_deleted > 0:
             tprint(f"[DB CLEANUP] {wildcards_deleted} wildcard(s) supprimé(s)")
         if orphans_deleted > 0:
-            tprint(f"[DB CLEANUP] {orphans_deleted} domaine(s) orphelin(s) supprimé(s) (SQL)")
+            tprint(f"[DB CLEANUP] {orphans_deleted} orphelin(s) supprimé(s)")
         if wildcards_deleted == 0 and orphans_deleted == 0:
-            tprint("[DB CLEANUP] Base propre, rien à nettoyer")
+            tprint("[DB CLEANUP] Base propre")
 
     except Exception as e:
         tprint(f"[DB CLEANUP ERROR] {e}")
 
 # ==================== DUMP DB ====================
 def dump_db():
-    """
-    AMÉLIORATION 5 : fetchmany() paginé au lieu de fetchall().
-    Sur 50 000 lignes, fetchall() alloue tout en mémoire d'un coup.
-    fetchmany(PAGE_SIZE) consomme une mémoire constante.
-    """
+    """fetchmany() paginé — mémoire constante (v2)."""
     tprint("[DUMP] Envoi du contenu de la DB sur Discord...")
-    PAGE_SIZE = 100  # lignes lues en mémoire à la fois
+    PAGE_SIZE = 100
 
     try:
         conn    = db.get_conn()
         cursor  = conn.cursor()
         summary = db.stats_summary()
 
-        header_embed = {
+        requests.post(DISCORD_WEBHOOK, json={"embeds": [{
             "title": "Base de données — Dump complet",
             "description": (
-                f"**Total:** {summary['total']} domaine(s) en monitoring\n"
+                f"**Total:** {summary['total']} domaine(s)\n"
                 f"**Taille:** {db.size_mb()} MB\n"
                 f"**Timeout:** {summary['timeout']} | **4xx:** {summary['4xx']} | **5xx:** {summary['5xx']}"
             ),
-            "color":     0x5865f2,
-            "footer":    {"text": "CT Monitor — DUMP_DB"},
+            "color": 0x5865f2, "footer": {"text": "CT Monitor — DUMP_DB"},
             "timestamp": datetime.utcnow().isoformat()
-        }
-        requests.post(DISCORD_WEBHOOK, json={"embeds": [header_embed]}, timeout=10)
+        }]}, timeout=10)
 
-        cursor.execute('''
-            SELECT domain, status_code, log_source, last_check
-            FROM subdomains
-            ORDER BY last_check DESC
-        ''')
+        cursor.execute('SELECT domain, status_code, log_source, last_check FROM subdomains ORDER BY last_check DESC')
 
         total_sent = 0
         chunk_size = 20
@@ -1385,101 +1374,73 @@ def dump_db():
             if not rows:
                 break
             buffer.extend(rows)
-
-            # Envoyer par tranches de chunk_size
             while len(buffer) >= chunk_size:
                 chunk  = buffer[:chunk_size]
                 buffer = buffer[chunk_size:]
-                lines  = []
-                for domain, status, source, last_check in chunk:
-                    status_str     = str(status) if status else "timeout"
-                    last_check_str = last_check[:16] if last_check else "jamais"
-                    lines.append(f"`{domain}` [{status_str}] — {last_check_str}")
+                lines  = [
+                    f"`{d}` [{s or 'timeout'}] — {(lc or '')[:16]}"
+                    for d, s, _, lc in chunk
+                ]
                 total_sent += len(chunk)
-                embed = {
-                    "title":       f"Domaines {total_sent-len(chunk)+1}–{total_sent}",
+                requests.post(DISCORD_WEBHOOK, json={"embeds": [{
+                    "title": f"Domaines {total_sent - len(chunk) + 1}–{total_sent}",
                     "description": "\n".join(lines),
-                    "color":       0x2f3136,
-                    "footer":      {"text": "CT Monitor — DUMP_DB"},
-                }
-                requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+                    "color": 0x2f3136, "footer": {"text": "CT Monitor — DUMP_DB"}
+                }]}, timeout=10)
                 time.sleep(0.5)
 
-        # Envoyer le reste du buffer
         if buffer:
-            lines = []
-            for domain, status, source, last_check in buffer:
-                status_str     = str(status) if status else "timeout"
-                last_check_str = last_check[:16] if last_check else "jamais"
-                lines.append(f"`{domain}` [{status_str}] — {last_check_str}")
+            lines = [f"`{d}` [{s or 'timeout'}] — {(lc or '')[:16]}" for d, s, _, lc in buffer]
             total_sent += len(buffer)
-            embed = {
-                "title":       f"Domaines (fin) — {len(buffer)} entrée(s)",
+            requests.post(DISCORD_WEBHOOK, json={"embeds": [{
+                "title": f"Domaines (fin) — {len(buffer)} entrée(s)",
                 "description": "\n".join(lines),
-                "color":       0x2f3136,
-                "footer":      {"text": "CT Monitor — DUMP_DB"},
-            }
-            requests.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+                "color": 0x2f3136, "footer": {"text": "CT Monitor — DUMP_DB"}
+            }]}, timeout=10)
 
-        end_embed = {
-            "title":       "Dump terminé",
-            "description": f"{total_sent} domaine(s) envoyés. Retire `DUMP_DB=1` dans Railway pour relancer le monitoring.",
-            "color":       0x00ff00,
-            "footer":      {"text": "CT Monitor — DUMP_DB"},
-        }
-        requests.post(DISCORD_WEBHOOK, json={"embeds": [end_embed]}, timeout=10)
-        tprint(f"[DUMP] {total_sent} domaine(s) envoyés sur Discord")
+        requests.post(DISCORD_WEBHOOK, json={"embeds": [{
+            "title": "Dump terminé",
+            "description": f"{total_sent} domaine(s) envoyés. Retire `DUMP_DB=1` pour relancer le monitoring.",
+            "color": 0x00ff00, "footer": {"text": "CT Monitor — DUMP_DB"}
+        }]}, timeout=10)
+        tprint(f"[DUMP] {total_sent} domaine(s) envoyés")
 
     except Exception as e:
         tprint(f"[DUMP ERROR] {e}")
         if DISCORD_WEBHOOK:
             requests.post(DISCORD_WEBHOOK, json={"embeds": [{
-                "title":       "Dump erreur",
-                "description": str(e),
-                "color":       0xff0000
+                "title": "Dump erreur", "description": str(e), "color": 0xff0000
             }]}, timeout=10)
 
 if os.environ.get('DUMP_DB', '0') == '1':
-    tprint("[DUMP] Mode DUMP_DB activé — envoi sur Discord...")
     dump_db()
-    tprint("[DUMP] Terminé — arrêt du container")
     exit(0)
 
 # ==================== DÉMARRAGE ====================
 tprint("[START] ================================================")
-tprint(f"[START] CT Monitor démarré — VERSION v2")
-tprint(f"[START] {NB_LOGS_ACTIFS} logs CT actifs")
-tprint(f"[START] {len(targets)} domaine(s) surveillés: {', '.join(sorted(targets))}")
-tprint(f"[START] Capacité max: {BATCH_SIZE * MAX_BATCHES_CRITICAL:,} certs/log/cycle (CRITICAL)")
-tprint(f"[START] HTTP concurrency limit: {HTTP_CONCURRENCY_LIMIT} connexions simultanées")
-tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History retention: {CHECK_HISTORY_RETENTION_DAYS}j")
+tprint(f"[START] CT Monitor v3")
+tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s) surveillés")
+tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | Session keep-alive activée")
+tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History: {CHECK_HISTORY_RETENTION_DAYS}j")
 tprint("[START] ================================================")
 
-tprint("[STARTUP] Etape 1/3 — Nettoyage base de données...")
+tprint("[STARTUP] 1/3 — Nettoyage DB...")
 cleanup_db()
-_db_stats = db.stats_summary()
-tprint(f"[STARTUP] DB: {_db_stats['total']} domaines | online={_db_stats['online']} | offline={_db_stats['total']-_db_stats['online']} | {db.size_mb()} MB")
-tprint(f"[STARTUP] DB detail: {_db_stats['timeout']} timeout | {_db_stats['4xx']} 4xx | {_db_stats['5xx']} 5xx")
+db.purge_history()
+_s = db.stats_summary()
+tprint(f"[STARTUP] DB: {_s['total']} domaines | online={_s['online']} | {db.size_mb()} MB")
 
-# Purge initiale de l'historique au démarrage
-db.purge_history(retention_days=CHECK_HISTORY_RETENTION_DAYS)
-
-tprint(f"[STARTUP] Etape 2/3 — Chargement {SUBDOMAINS_FILE}...")
-if not os.path.exists(SUBDOMAINS_FILE):
-    tprint(f"[STARTUP] {SUBDOMAINS_FILE} absent — aucun sous-domaine manuel à charger")
+tprint(f"[STARTUP] 2/3 — Chargement {SUBDOMAINS_FILE}...")
+if os.path.exists(SUBDOMAINS_FILE):
+    loaded_count, dup_count = load_subdomains_from_file()
+    tprint(f"[STARTUP] {loaded_count} ajouté(s), {dup_count} déjà en DB")
 else:
-    loaded_count, duplicate_count = load_subdomains_from_file()
-    tprint(f"[STARTUP] Subdomains: {loaded_count} nouveau(x) ajouté(s), {duplicate_count} déjà en DB")
-    _db_stats = db.stats_summary()
-    tprint(f"[STARTUP] DB après chargement: {_db_stats['total']} domaine(s) en monitoring | {db.size_mb()} MB")
+    tprint(f"[STARTUP] {SUBDOMAINS_FILE} absent")
 
-tprint("[STARTUP] Etape 3/3 — Démarrage thread cron recheck...")
-cron_thread = threading.Thread(target=cron_recheck_unreachable, daemon=True)
-cron_thread.start()
+tprint("[STARTUP] 3/3 — Démarrage thread cron...")
+threading.Thread(target=cron_recheck_unreachable, daemon=True, name="CronRecheck").start()
 time.sleep(1)
-tprint("[STARTUP] Thread cron démarré — recheck toutes les 5 minutes")
-tprint("[STARTUP] ================================================")
-tprint("[STARTUP] Démarrage boucle principale CT monitoring...")
+tprint("[STARTUP] Thread cron démarré")
 tprint("[STARTUP] ================================================")
 
 # ==================== BOUCLE PRINCIPALE ====================
@@ -1494,34 +1455,37 @@ while True:
 
         tprint(f"[CYCLE #{cycle}] ---- {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ----")
 
+        # Réinitialiser le set seen_in_cycle global pour ce nouveau cycle
+        cycle_reset()
+
         monitor_all_logs()
         save_positions()
 
         cleared = notif_cache.clear_expired()
         if cleared > 0:
-            tprint(f"[CYCLE #{cycle}] Cache notifs: {cleared} entree(s) expiree(s) supprimee(s)")
+            tprint(f"[CYCLE #{cycle}] Notif cache: {cleared} expirée(s)")
 
         cycle_duration = int(time.time() - cycle_start)
+        _s = db.stats_summary()
 
-        _db_stats = db.stats_summary()
         tprint(f"[CYCLE #{cycle}] Terminé en {cycle_duration}s")
         tprint(f"[CYCLE #{cycle}] Certificats analysés : {stats['certificats_analysés']:,}")
         tprint(f"[CYCLE #{cycle}] Matches trouvés      : {stats['matches_trouvés']:,}")
         tprint(f"[CYCLE #{cycle}] HTTP checks          : {stats['http_checks']:,}")
         tprint(f"[CYCLE #{cycle}] Alertes envoyées     : {stats['alertes_envoyées']:,}")
         tprint(f"[CYCLE #{cycle}] Duplicates évités    : {stats['duplicates_évités']:,}")
-        tprint(f"[CYCLE #{cycle}] Discord queue        : {_discord_queue.qsize()} en attente")
-        tprint(f"[CYCLE #{cycle}] DB monitoring        : {_db_stats['total']} domaine(s) | {db.size_mb()} MB")
-        tprint(f"[CYCLE #{cycle}] DB detail            : {_db_stats['timeout']} timeout | {_db_stats['4xx']} 4xx | {_db_stats['5xx']} 5xx")
+        tprint(f"[CYCLE #{cycle}] Discord queue        : {_discord_queue.qsize()} en attente | {stats['discord_dropped']} perdu(s)")
+        tprint(f"[CYCLE #{cycle}] DB                  : {_s['total']} domaines | {db.size_mb()} MB")
+        tprint(f"[CYCLE #{cycle}] DB detail            : {_s['timeout']} timeout | {_s['4xx']} 4xx | {_s['5xx']} 5xx")
         tprint(f"[CYCLE #{cycle}] Prochain cycle dans {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 
     except KeyboardInterrupt:
         tprint("[STOP] Arrêt demandé")
         save_positions()
-        # Arrêt propre du worker Discord
         _discord_queue.put(None)
         _discord_thread.join(timeout=5)
+        HTTP_WORKER_POOL.shutdown(wait=False)
         break
     except Exception as e:
         tprint(f"[ERROR] {e}")
