@@ -13,12 +13,13 @@ import requests
 import json
 import time
 import os
+import socket
 import threading
+import traceback
 import base64
 import sqlite3
 import hashlib
 import urllib3
-import re
 from datetime import datetime
 from urllib.parse import urlparse
 from cryptography import x509
@@ -27,8 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 
 # Thread-safe print — défini en premier car utilisé dès le démarrage
-import threading as _threading
-_print_lock = _threading.Lock()
+_print_lock = threading.Lock()
 
 def tprint(msg):
     with _print_lock:
@@ -281,7 +281,8 @@ class CertificateDatabase:
             tprint(f"[DB ERROR] add_subdomain_from_file {domain}: {e}")
             return False
 
-    def get_offline(self, limit=100):
+    def get_offline(self, limit=100, offset=0):
+        """Retourne les domaines offline par page. Utiliser offset pour paginer."""
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
@@ -290,12 +291,22 @@ class CertificateDatabase:
                 FROM subdomains
                 WHERE is_online = 0
                 ORDER BY last_check ASC NULLS FIRST
-                LIMIT ?
-            ''', (limit,))
+                LIMIT ? OFFSET ?
+            ''', (limit, offset))
             return cursor.fetchall()
         except Exception as e:
             tprint(f"[DB ERROR] get_offline: {e}")
             return []
+
+    def count_offline(self):
+        """Nombre total de domaines offline."""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM subdomains WHERE is_online = 0')
+            return cursor.fetchone()[0]
+        except Exception:
+            return 0
 
     def get_all_domains(self):
         try:
@@ -381,10 +392,10 @@ class CertificateDatabase:
 
 db = CertificateDatabase(DATABASE_FILE)
 
-# ==================== DÉTECTION INTELLIGENTE FAUX POSITIFS ====================
+# ==================== DÉTECTION FAUX POSITIFS ====================
 
-# Extensions/paths dont on connaît le type de contenu attendu
-# Chaque entrée: pattern_dans_le_path → mots-clés requis dans le body pour valider
+# Mots-clés attendus par type de path — utilisé comme dernier filet de sécurité
+# dans check_path() après le rejet HTML (Content-Type + body)
 PATH_CONTENT_EXPECTATIONS = {
     '.env':             ['=', 'KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DB_', 'APP_', 'HOST'],
     '.env.backup':      ['=', 'KEY', 'SECRET', 'PASSWORD', 'TOKEN'],
@@ -402,163 +413,6 @@ PATH_CONTENT_EXPECTATIONS = {
     'adminer':          ['Adminer', 'adminer', 'db_driver'],
     'phpmyadmin':       ['phpMyAdmin', 'pma_', 'PMA_'],
 }
-
-# Extensions qui ne doivent JAMAIS retourner du HTML (si HTML → catch-all certain)
-NON_HTML_EXTENSIONS = [
-    '.sql', '.env', '.bak', '.backup', '.conf', '.config',
-    '.yml', '.yaml', '.ini', '.log', '.gz', '.tar', '.zip',
-    '.json', '.xml', '.csv', '.pem', '.key', '.crt', '.cer',
-]
-
-# Patterns HTML structurels indiquant une page d'authentification
-# On analyse la STRUCTURE, pas les textes en langue naturelle
-AUTH_HTML_PATTERNS = [
-    # OAuth2 Proxy (TomTom, etc.)
-    'oauth2/start',
-    'oauth2/sign_in',
-    '/oauth2/callback',
-    '/oauth2/static/',
-    'oauth2-proxy',
-    # Formulaires avec champ password = page de login
-    'type="password"',
-    "type='password'",
-    # SSO enterprise
-    'oidc/login',
-    'saml/login',
-    '/sso/login',
-    '/sso/auth',
-    '/auth/login',
-    # Providers connus
-    'login.microsoftonline.com',
-    'aadcdn.msftauth.net',
-    'aadcdn.msauth.net',
-    'accounts.google.com',
-    'okta.com/login',
-    'auth0.com',
-    'onelogin.com',
-    'pingidentity.com',
-    # Azure AD spécifique
-    'ConvergedSignIn',
-    'estsauth',
-    # Tokens CSRF (indique un formulaire de login)
-    'name="csrf_token"',
-    'name="_token"',
-    'name="authenticity_token"',
-    # Classes/IDs HTML typiques de formulaires login
-    'id="login-form"',
-    'id="loginform"',
-    'id="loginForm"',
-    'id="sign-in-form"',
-    'class="login-form"',
-    'class="loginform"',
-    'class="loginForm"',
-    'class="signin-form"',
-    # Marqueurs structurels de pages login custom (ex: Vodafone Automotive)
-    # Title qui contient "login" (insensible à la casse via body_low)
-    '- login</title>',
-    'login</title>',
-    # Keycloak
-    'kc-form-login',
-    'kc-page-title',
-    'kc-header',
-    '/keycloak/realms/',
-    '/auth/realms/',
-    'class="login-pf"',
-    'login-pf-page',
-    # OAuth2 generic
-    'oauth2/authorize',
-    'oauth/authorize',
-    '/connect/authorize',
-]
-
-# Indicateurs de SPA catch-all
-SPA_CATCHALL_INDICATORS = [
-    'id="root"',        # React
-    'id="app"',         # Vue
-    'id="__next"',      # Next.js
-    'id="__nuxt"',      # Nuxt.js
-    'id="ember',        # Ember
-    'ng-version=',      # Angular
-]
-
-
-def is_auth_page(body: str) -> tuple:
-    """
-    Détecte sémantiquement une page d'authentification/login.
-    Analyse la STRUCTURE HTML, pas le texte affiché à l'utilisateur
-    (indépendant de la langue de la page).
-    Retourne (True, raison) ou (False, None).
-    """
-    body_low = body.lower()
-
-    # 1. Patterns HTML d'auth directs
-    for pattern in AUTH_HTML_PATTERNS:
-        if pattern.lower() in body_low:
-            return (True, f"auth_pattern: '{pattern}'")
-
-    # 2. Formulaire avec action pointant vers un endpoint d'auth
-    form_actions = re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', body_low)
-    for action in form_actions:
-        for keyword in ['/oauth', '/auth', '/login', '/signin', '/sso', '/saml', '/oidc', '/connect']:
-            if keyword in action:
-                return (True, f"form_action_auth: '{action}'")
-
-    # 3. Meta refresh vers un IdP externe
-    meta_refreshes = re.findall(
-        r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*url=([^"\'&\s;]+)',
-        body_low
-    )
-    for url in meta_refreshes:
-        for keyword in ['/oauth', '/auth', '/login', '/sso', '/saml',
-                        'microsoftonline', 'accounts.google', 'okta', 'auth0']:
-            if keyword in url:
-                return (True, f"meta_refresh_auth: '{url}'")
-
-    # 4. SPA payment/3DS (Vodacom pattern) — postMessage 3DS sans contenu réel
-    if 'postmessage' in body_low and ('3ds' in body_low or 'payment' in body_low or '3ds_status' in body_low):
-        return (True, "spa_payment: postMessage 3DS/payment detected")
-
-    # 5. Marqueur applicatif custom : id="currentpage" dont la valeur est "login"
-    #    ex: <div id="currentpage" style="display:none">login</div>
-    currentpage_vals = re.findall(r'id=["\']currentpage["\'][^>]*>([^<]+)<', body_low)
-    for val in currentpage_vals:
-        if val.strip() == 'login':
-            return (True, "custom_login_page: id='currentpage' value='login'")
-
-    return (False, None)
-
-
-def is_spa_catchall(body: str, path: str) -> tuple:
-    """
-    Détecte si le serveur sert une SPA générique (index.html)
-    pour un path qui devrait retourner un contenu spécifique.
-
-    Règle 1 : extension non-HTML + body HTML = catch-all certain
-    Règle 2 : indicateurs SPA + titre sans rapport avec le path
-    Retourne (True, raison) ou (False, None).
-    """
-    path_low = path.lower()
-    body_low = body[:5000].lower()
-    is_html  = '<html' in body_low or '<!doctype' in body_low
-
-    # Règle 1 : extension non-HTML → HTML retourné = catch-all
-    for ext in NON_HTML_EXTENSIONS:
-        if path_low.endswith(ext) and is_html:
-            return (True, f"non_html_ext '{ext}' returned HTML")
-
-    # Règle 2 : indicateurs SPA dans le body
-    if is_html:
-        for indicator in SPA_CATCHALL_INDICATORS:
-            if indicator in body_low:
-                # Vérifier que le titre n'est pas lié au path
-                titles = re.findall(r'<title[^>]*>([^<]+)</title>', body_low)
-                if titles:
-                    title = titles[0].strip()
-                    path_segments = [s for s in path_low.split('/') if s and len(s) > 2]
-                    if path_segments and not any(seg in title for seg in path_segments):
-                        return (True, f"spa_indicator '{indicator}', title='{title}' unrelated to path")
-
-    return (False, None)
 
 
 def check_content_coherence(body: str, path: str) -> tuple:
@@ -616,11 +470,11 @@ WAF_BLOCK_BODY_SIGNATURES = [
 
 def is_waf_block(response) -> tuple:
     """
-    Détecte les pages de blocage WAF, d'authentification et catch-all SPA.
-    Utilisé par check_domain() pour les checks généraux.
+    Détecte les pages de blocage WAF et d'authentification.
+    Utilisé uniquement par check_domain() pour qualifier les 200 généraux.
 
-    Pour check_path() (paths sensibles), la détection est plus fine
-    via is_auth_page() + is_spa_catchall() + check_content_coherence().
+    check_path() n'utilise PAS cette fonction — il rejette directement
+    tout Content-Type text/html ou body commençant par <!DOCTYPE/<html.
     """
     headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
@@ -645,11 +499,6 @@ def is_waf_block(response) -> tuple:
         # Incapsula
         if is_short and '_incapsula_resource' in body_low and 'noindex' in body_low:
             return (True, "waf_block: incapsula")
-
-        # Détection page d'auth (OAuth2, SSO, SAML, Azure AD, etc.)
-        is_auth, auth_reason = is_auth_page(body)
-        if is_auth:
-            return (True, f"auth_page: {auth_reason}")
 
     except Exception:
         pass
@@ -974,7 +823,6 @@ def check_domain(domain):
 
 
 def check_port(host, port, timeout=10):
-    import socket
     try:
         start   = time.time()
         sock    = socket.create_connection((host, port), timeout=timeout)
@@ -1202,60 +1050,80 @@ def parse_certificate(entry):
             stats['parse_errors'] += 1
         return []
 
+# Flag global pour éviter deux scans PathMonitor en parallèle
+_path_scan_running = threading.Event()
+
 # ==================== CRON JOB - RECHECK ====================
 def cron_recheck_unreachable():
     tprint("[CRON] Thread recheck démarré")
+    RECHECK_BATCH = 100  # domaines recheckés par batch pour ne pas bloquer trop longtemps
+
     while True:
         try:
-            domains = db.get_offline(limit=100)
-            total   = db.count()
+            total_offline = db.count_offline()
+            total         = db.count()
+            tprint(f"[CRON] ---- Recheck démarré — {total} domaine(s) en monitoring | {total_offline} offline ----")
 
-            tprint(f"[CRON] ---- Recheck démarré — {total} domaine(s) en monitoring ----")
+            back_online = still_down = 0
 
-            if not domains:
-                tprint("[CRON] Aucun domaine à recheck")
+            if total_offline == 0:
+                tprint("[CRON] Aucun domaine offline à recheck")
             else:
-                back_online = still_down = 0
+                # Paginer sur tous les domaines offline, batch par batch
+                offset = 0
+                while True:
+                    domains = db.get_offline(limit=RECHECK_BATCH, offset=offset)
+                    if not domains:
+                        break
 
-                for domain, base_domain, last_check in domains:
-                    host, port = parse_subdomain_entry(domain)
+                    for domain, base_domain, last_check in domains:
+                        host, port = parse_subdomain_entry(domain)
+                        status_code, response_time = check_domain(host)
 
-                    status_code, response_time = check_domain(host)
+                        port_status = ""
+                        if port:
+                            port_open, port_time = check_port(host, port)
+                            port_status = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
+                            if port_open and (not status_code or status_code >= 400):
+                                status_code = 200
+                                tprint(f"[CRON] 🔌 {domain} — port {port} ouvert")
 
-                    port_status = ""
-                    if port:
-                        port_open, port_time = check_port(host, port)
-                        port_status = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
-                        if port_open and (not status_code or status_code >= 400):
-                            status_code = 200
-                            tprint(f"[CRON] 🔌 {domain} — port {port} ouvert")
+                        status_str = str(status_code) if status_code else "timeout"
 
-                    status_str = str(status_code) if status_code else "timeout"
+                        if status_code == 200:
+                            tprint(f"[CRON] ✅ {domain} [{status_str}]{port_status} — redevenu accessible!")
+                            send_now_accessible_alert(domain)
+                            db.mark_online(domain, status_code)
+                            back_online += 1
+                        else:
+                            db.update_check(domain, status_code, response_time)
+                            tprint(f"[CRON] 🔴 {domain} [{status_str}]{port_status} — toujours hors ligne")
+                            still_down += 1
 
-                    if status_code == 200:
-                        tprint(f"[CRON] ✅ {domain} [{status_str}]{port_status} — redevenu accessible!")
-                        send_now_accessible_alert(domain)
-                        db.mark_online(domain, status_code)
-                        back_online += 1
-                    else:
-                        db.update_check(domain, status_code, response_time)
-                        tprint(f"[CRON] 🔴 {domain} [{status_str}]{port_status} — toujours hors ligne")
-                        still_down += 1
+                    offset += RECHECK_BATCH
 
-            tprint(f"[CRON] Résumé: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
+            tprint(f"[CRON] Résumé recheck: {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
 
-            # path_monitor.check_all() est lancé dans un thread séparé pour ne pas
-            # bloquer le prochain cycle de recheck si le scan de paths prend des heures
-            paths_thread = threading.Thread(target=path_monitor.check_all, daemon=True, name="PathScan")
-            paths_thread.start()
-            tprint(f"[CRON] Scan paths lancé en arrière-plan (thread {paths_thread.name})")
+            # Lancer le scan paths seulement si aucun scan n'est déjà en cours
+            if _path_scan_running.is_set():
+                tprint("[CRON] Scan paths ignoré — scan précédent encore en cours")
+            else:
+                def _run_path_scan():
+                    _path_scan_running.set()
+                    try:
+                        path_monitor.check_all()
+                    finally:
+                        _path_scan_running.clear()
+
+                paths_thread = threading.Thread(target=_run_path_scan, daemon=True, name="PathScan")
+                paths_thread.start()
+                tprint(f"[CRON] Scan paths lancé en arrière-plan")
 
             tprint(f"[CRON] Prochain recheck dans {UNREACHABLE_RECHECK_INTERVAL}s")
             time.sleep(UNREACHABLE_RECHECK_INTERVAL)
 
         except Exception as e:
             tprint(f"[CRON ERROR] {e}")
-            import traceback
             traceback.print_exc()
             time.sleep(60)
 
@@ -1295,7 +1163,13 @@ def monitor_log(log_config):
     all_results   = []
     seen_in_cycle = set()
 
-    while current_pos < tree_size and batches_done < max_batches:
+    while batches_done < max_batches:
+        with stats_lock:
+            current_pos = stats['positions'][log_name]
+
+        if current_pos >= tree_size:
+            break
+
         end_pos = min(current_pos + BATCH_SIZE, tree_size)
         try:
             response = requests.get(
@@ -1346,12 +1220,10 @@ def monitor_log(log_config):
                 if base:
                     db.add_domain(domain, base, status_code, log_name)
 
-        current_pos                  = end_pos
         with stats_lock:
-            stats['positions'][log_name] = current_pos
-        batches_done                += 1
-        with stats_lock:
-            stats['batches_processed'] += 1
+            stats['positions'][log_name] = end_pos
+            stats['batches_processed']  += 1
+        batches_done += 1
 
     if all_results:
         send_discovery_alert(all_results, log_name)
@@ -1542,7 +1414,6 @@ while True:
         save_positions()
         break
     except Exception as e:
-        import traceback
         tprint(f"[ERROR] {e}")
         traceback.print_exc()
         save_positions()
