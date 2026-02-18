@@ -436,11 +436,29 @@ class PathMonitor:
             tprint(f"[PATHS ERROR] {e}")
 
     def check_path(self, url):
+        MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB max
+        
         try:
             response      = requests.get(url, timeout=HTTP_CHECK_TIMEOUT, verify=False, allow_redirects=True,
-                                         headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'})
+                                         headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
+                                         stream=True)
             response_time = int(response.elapsed.total_seconds() * 1000)
+            
             if response.status_code == 200:
+                # Vérifier le Content-Type
+                content_type = response.headers.get('Content-Type', '').lower()
+                if content_type and 'text/html' not in content_type and 'application/json' not in content_type and 'text/plain' not in content_type:
+                    return (403, None, response_time, f"Invalid Content-Type: {content_type}")
+                
+                # Vérifier la taille du contenu
+                content_length = response.headers.get('Content-Length', '0')
+                try:
+                    size = int(content_length)
+                    if size > MAX_CONTENT_SIZE:
+                        return (403, None, response_time, f"Content too large ({size} bytes)")
+                except:
+                    pass
+                
                 # Vérifier si c'est un WAF block
                 waf, reason = is_waf_block(response)
                 if waf:
@@ -450,12 +468,23 @@ class PathMonitor:
                 
                 # Validation: le contenu doit avoir une taille minimale (> 200 bytes)
                 # pour éviter les pages vides ou de redirection
-                if content and len(content) > 200:
+                if content and len(content) > 200 and len(content) <= MAX_CONTENT_SIZE:
                     return (200, content, response_time, None)
-                elif content:
+                elif content and len(content) <= 200:
                     return (403, None, response_time, "Content too small (< 200 bytes)")
                 else:
                     return (403, None, response_time, "Content is empty")
+            
+            # Gérer les 403 avec contenu sensible potentiel
+            elif response.status_code == 403:
+                try:
+                    content = response.text
+                    if content and len(content) > 500 and not any(sig in content.lower() for sig in ['403', 'forbidden', 'access denied']):
+                        tprint(f"[403_WITH_CONTENT] {url} → Contenu sensible potentiel en 403")
+                except:
+                    pass
+                return (403, None, response_time, None)
+            
             return (response.status_code, None, response_time, None)
         except requests.exceptions.Timeout:
             return (None, None, HTTP_CHECK_TIMEOUT * 1000, "Timeout")
@@ -702,13 +731,14 @@ def check_domain(domain):
     Fait un GET (pas HEAD) pour pouvoir analyser le body et détecter les WAF.
     Retourne (status_code_effectif, response_time_ms).
     Si 200 mais WAF détecté → retourne (403, elapsed) pour signaler l'inaccessibilité réelle.
+    
+    Validations:
+    - Limite de redirections: 5 max
+    - Redirection vers domaine différent: bloquée (403)
+    - Taille de contenu: max 10MB
     """
-    # Multiple User-Agents pour éviter les blocages
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    ]
+    MAX_REDIRECTS = 5
+    MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB
     
     for protocol in ['https', 'http']:
         try:
@@ -718,23 +748,59 @@ def check_domain(domain):
                 timeout=HTTP_CHECK_TIMEOUT,
                 allow_redirects=True,
                 verify=False,
-                headers={'User-Agent': user_agents[hash(domain) % len(user_agents)]},
-                stream=True  # ne télécharge pas tout le body immédiatement
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+                stream=True,  # ne télécharge pas tout le body immédiatement
+                allow_redirects=True
             )
             elapsed = int((time.time() - start) * 1000)
 
-            # Vérifier si une redirection s'est produite
+            # Vérifier les redirections
             requested_url = f"{protocol}://{domain}"
+            
+            # Vérifier si une redirection s'est produite
             if response.url != requested_url and response.url.lower() != f"{protocol}://{domain.lower()}/":
+                # Vérifier la profondeur des redirections
+                if len(response.history) > MAX_REDIRECTS:
+                    tprint(f"[REDIRECT_LIMIT] {domain} → Trop de redirections ({len(response.history)})")
+                    return (403, elapsed)
+                
+                # Vérifier si la redirection va vers un domaine différent
+                from urllib.parse import urlparse
+                original_domain = urlparse(requested_url).netloc
+                redirect_domain = urlparse(response.url).netloc
+                
+                if original_domain.lower() != redirect_domain.lower():
+                    tprint(f"[REDIRECT_DOMAIN] {domain} → {redirect_domain} (domaine différent)")
+                    return (403, elapsed)  # Bloquer les redirections cross-domain
+                
                 tprint(f"[REDIRECT] {domain} → {response.url}")
 
             # Si 200 : vérifier si c'est un vrai 200 ou un WAF
             if response.status_code == 200:
+                # Vérifier le Content-Type
+                content_type = response.headers.get('Content-Type', '').lower()
+                if content_type and 'text/html' not in content_type and 'application/json' not in content_type:
+                    tprint(f"[CONTENT_TYPE] {domain} → {response.headers.get('Content-Type')} (non-HTML/JSON)")
+                    return (403, elapsed)  # Pas du contenu web
+                
                 waf, reason = is_waf_block(response)
                 if waf:
                     tprint(f"[WAF] {domain} → 200 bloqué par WAF ({reason})")
                     return (403, elapsed)  # traité comme inaccessible
                 return (200, elapsed)
+            
+            # Gérer les 403 avec contenu sensible
+            elif response.status_code == 403:
+                # Lire le contenu du 403 pour vérifier si c'est du vrai contenu
+                try:
+                    content = response.text
+                    # Si le 403 a du contenu > 500 bytes et pas d'erreur standard, c'est peut-être du contenu sensible exposé
+                    if content and len(content) > 500 and not any(sig in content.lower() for sig in ['403', 'forbidden', 'access denied']):
+                        tprint(f"[403_WITH_CONTENT] {domain} → 403 avec contenu sensible potentiel")
+                        # Retourner 403 (pas d'alerte) mais logger pour révision manuelle
+                except:
+                    pass
+                return (403, elapsed)
 
             return (response.status_code, elapsed)
 
