@@ -63,6 +63,7 @@ PARALLEL_LOGS                = 28
 CACHE_MAX_SIZE               = 500000
 TIMEOUT_PER_LOG              = 300
 HTTP_CHECK_TIMEOUT           = 5
+PATH_CHECK_TIMEOUT           = 3   # Timeout réduit pour les paths : les vrais fichiers sensibles répondent vite
 UNREACHABLE_RECHECK_INTERVAL = 300  # 5 minutes
 
 # CT LOGS (28 actifs)
@@ -698,7 +699,7 @@ class PathMonitor:
         try:
             response      = requests.get(
                 url,
-                timeout=HTTP_CHECK_TIMEOUT,
+                timeout=PATH_CHECK_TIMEOUT,
                 verify=False,
                 allow_redirects=True,
                 headers={'User-Agent': 'Mozilla/5.0 (compatible; CTMonitor/1.0)'},
@@ -776,7 +777,7 @@ class PathMonitor:
 
         except requests.exceptions.Timeout:
             tprint(f"[PATHS WARN] {url} → Timeout")
-            return (None, None, HTTP_CHECK_TIMEOUT * 1000, "Timeout")
+            return (None, None, PATH_CHECK_TIMEOUT * 1000, "Timeout")
         except Exception as e:
             tprint(f"[PATHS ERROR] {url} → {str(e)[:100]}")
             return (None, None, None, str(e))
@@ -845,7 +846,7 @@ class PathMonitor:
         total_found = total_checked = total_errors = 0
         start = time.time()
 
-        MAX_WORKERS = 10
+        MAX_WORKERS = 50
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures   = {executor.submit(self.check_domain_worker, domain): domain for domain in all_domains}
             completed = 0
