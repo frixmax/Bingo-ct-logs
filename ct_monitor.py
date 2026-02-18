@@ -398,22 +398,15 @@ db = CertificateDatabase(DATABASE_FILE)
 # ==================== PATHS MONITOR ====================
 class PathMonitor:
     # Paths predefinies — chargees depuis paths.txt + defaults integres
+    # RÉDUITS pour éviter de bloquer le CT monitoring
     DEFAULT_PATHS = [
         "/.env",
         "/.env.backup",
-        "/.env.old",
-        "/.env.prod",
-        "/.env.production",
-        "/.env.local",
         "/.git/config",
-        "/.git/HEAD",
         "/wp-config.php",
-        "/config.php",
         "/actuator/env",
-        "/actuator/beans",
         "/api/v1/users",
         "/backup.sql",
-        "/dump.sql",
     ]
 
     def __init__(self, paths_file):
@@ -423,7 +416,7 @@ class PathMonitor:
 
     def load_paths(self):
         if not os.path.exists(self.paths_file):
-            tprint(f"[PATHS] {self.paths_file} absent — utilisation des paths par defaut ({len(self.paths)})")
+            tprint(f"[PATHS] {self.paths_file} absent — utilisation des {len(self.paths)} paths par defaut")
             return
         try:
             with open(self.paths_file, 'r') as f:
@@ -437,7 +430,7 @@ class PathMonitor:
             tprint(f"[PATHS ERROR] {e}")
 
     def check_path(self, url):
-        MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB max
+        MAX_CONTENT_SIZE = 5 * 1024 * 1024  # 5 MB max
         
         try:
             response      = requests.get(url, timeout=HTTP_CHECK_TIMEOUT, verify=False, allow_redirects=True,
@@ -451,11 +444,12 @@ class PathMonitor:
                 if content_type and 'text/html' not in content_type and 'application/json' not in content_type and 'text/plain' not in content_type:
                     return (403, None, response_time, f"Invalid Content-Type: {content_type}")
                 
-                # Vérifier la taille du contenu
+                # Vérifier la taille du contenu avec limite
                 content_length = response.headers.get('Content-Length', '0')
                 try:
                     size = int(content_length)
                     if size > MAX_CONTENT_SIZE:
+                        tprint(f"[PATHS WARN] {url} → Content too large ({size} bytes, max {MAX_CONTENT_SIZE})")
                         return (403, None, response_time, f"Content too large ({size} bytes)")
                 except:
                     pass
@@ -465,31 +459,39 @@ class PathMonitor:
                 if waf:
                     return (403, None, response_time, f"WAF: {reason}")
                 
-                content = response.text
-                
-                # Validation: le contenu doit avoir une taille minimale (> 200 bytes)
-                # pour éviter les pages vides ou de redirection
-                if content and len(content) > 200 and len(content) <= MAX_CONTENT_SIZE:
-                    return (200, content, response_time, None)
-                elif content and len(content) <= 200:
-                    return (403, None, response_time, "Content too small (< 200 bytes)")
-                else:
-                    return (403, None, response_time, "Content is empty")
+                # Lire le contenu avec timeout et limite de taille
+                try:
+                    content = response.text[:MAX_CONTENT_SIZE]  # Limiter à MAX_CONTENT_SIZE
+                    
+                    # Validation: le contenu doit avoir une taille minimale (> 200 bytes)
+                    if content and len(content) > 200 and len(content) <= MAX_CONTENT_SIZE:
+                        return (200, content, response_time, None)
+                    elif content and len(content) <= 200:
+                        tprint(f"[PATHS WARN] {url} → Content too small ({len(content)} bytes)")
+                        return (403, None, response_time, "Content too small (< 200 bytes)")
+                    else:
+                        tprint(f"[PATHS WARN] {url} → Content is empty")
+                        return (403, None, response_time, "Content is empty")
+                except Exception as e:
+                    tprint(f"[PATHS ERROR] {url} → Error reading content: {str(e)[:100]}")
+                    return (None, None, response_time, f"Error reading body: {str(e)[:50]}")
             
             # Gérer les 403 avec contenu sensible potentiel
             elif response.status_code == 403:
                 try:
-                    content = response.text
+                    content = response.text[:1000]  # Limite pour vérifier
                     if content and len(content) > 500 and not any(sig in content.lower() for sig in ['403', 'forbidden', 'access denied']):
-                        tprint(f"[403_WITH_CONTENT] {url} → Contenu sensible potentiel en 403")
+                        tprint(f"[PATHS WARN] {url} → 403 with potential sensitive content")
                 except:
                     pass
                 return (403, None, response_time, None)
             
             return (response.status_code, None, response_time, None)
         except requests.exceptions.Timeout:
+            tprint(f"[PATHS WARN] {url} → Timeout")
             return (None, None, HTTP_CHECK_TIMEOUT * 1000, "Timeout")
         except Exception as e:
+            tprint(f"[PATHS ERROR] {url} → {str(e)[:100]}")
             return (None, None, None, str(e))
 
     def _send_embed(self, embed):
@@ -539,7 +541,16 @@ class PathMonitor:
                     break  # 4xx/5xx = path n existe pas, passe au suivant
         return found, checked, errors
 
+    def check_domain_worker(self, domain):
+        """Wrapper pour utiliser avec ThreadPoolExecutor"""
+        try:
+            return self.check_domain(domain)
+        except Exception as e:
+            tprint(f"[PATHS ERROR] check_domain_worker {domain}: {e}")
+            return 0, 0, 0
+
     def check_all(self):
+        """Vérifie les paths sur tous les domaines avec workers en parallèle"""
         all_domains = db.get_all_domains()
         if not all_domains:
             tprint("[PATHS CRON] Aucun domaine en DB")
@@ -547,28 +558,41 @@ class PathMonitor:
 
         total_requests = len(self.paths) * len(all_domains)
         tprint(f"[PATHS CRON] Debut scan — {len(all_domains)} domaines x {len(self.paths)} paths = {total_requests} requetes max")
+        tprint(f"[PATHS CRON] Utilisation de workers parallèles pour optimiser les performances")
 
         total_found  = 0
         total_checked = 0
         total_errors  = 0
         start = time.time()
 
-        for i, domain in enumerate(all_domains, 1):
-            found, checked, errors = self.check_domain(domain)
-            total_found   += found
-            total_checked += checked
-            total_errors  += errors
-            # Log de progression tous les 10 domaines
-            if i % 10 == 0:
-                tprint(f"[PATHS CRON] Progression: {i}/{len(all_domains)} domaines scannés...")
+        # Utiliser ThreadPoolExecutor pour vérifier les domaines en parallèle
+        MAX_WORKERS = 10  # 10 workers en parallèle
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(self.check_domain_worker, domain): domain for domain in all_domains}
+            
+            completed = 0
+            for future in as_completed(futures):
+                domain = futures[future]
+                try:
+                    found, checked, errors = future.result()
+                    total_found   += found
+                    total_checked += checked
+                    total_errors  += errors
+                    completed += 1
+                    
+                    # Log de progression tous les 50 domaines
+                    if completed % 50 == 0:
+                        tprint(f"[PATHS CRON] Progression: {completed}/{len(all_domains)} domaines scannés...")
+                except Exception as e:
+                    tprint(f"[PATHS CRON ERROR] {domain}: {str(e)[:100]}")
 
         elapsed = int(time.time() - start)
         tprint(f"[PATHS CRON] Scan terminé en {elapsed}s")
         tprint(f"[PATHS CRON] Requetes: {total_checked} effectuées | {total_errors} erreurs réseau")
         if total_found > 0:
-            tprint(f"[PATHS CRON] {total_found} fichier(s) sensible(s) trouvé(s) !")
+            tprint(f"[PATHS CRON] ⚠️  {total_found} fichier(s) sensible(s) trouvé(s) !")
         else:
-            tprint(f"[PATHS CRON] Aucun fichier sensible trouvé")
+            tprint(f"[PATHS CRON] ✅ Aucun fichier sensible trouvé")
 path_monitor = PathMonitor(PATHS_FILE)
 
 # ==================== CHARGEMENT DOMAINES CIBLES ====================
