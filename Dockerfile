@@ -1,26 +1,29 @@
 FROM python:3.11-slim
 
+# Security: Run as non-root user
+RUN useradd -m -u 1000 monitor
+
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libssl-dev \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir requests cryptography urllib3
+# Install dependencies from requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Script principal
+# Copy application and configuration files
 COPY ct_monitor.py .
-
-# Fichiers de configuration — copiés dans l'image au build
-# Pour modifier : éditer dans le repo et pousser → Railway rebuild automatiquement
 COPY domains.txt .
-COPY subdomains.txt .
 COPY paths.txt .
+COPY subdomains.txt .
 
-RUN mkdir -p /app/data
+# Create data directory with correct ownership
+RUN mkdir -p /app/data && chown -R monitor:monitor /app
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD pgrep -f ct_monitor.py || exit 1
+# Switch to non-root user
+USER monitor
 
-CMD ["python3", "-u", "ct_monitor.py"]
+# Healthcheck: Monitor heartbeat file
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD python3 -c "import os, time; f='/tmp/ct_monitor.heartbeat'; exit(0 if os.path.exists(f) and (time.time() - os.path.getmtime(f)) < 120 else 1)"
+
+# Start monitoring
+CMD ["python3", "ct_monitor.py"]
