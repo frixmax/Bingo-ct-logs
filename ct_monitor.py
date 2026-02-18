@@ -199,13 +199,13 @@ class CertificateDatabase:
             print(f"[DB ERROR] subdomain_exists: {e}")
             return False
 
-    def add_subdomain_from_file(self, domain, base_domain):
+    def add_subdomain_from_file(self, domain, base_domain, status_code=None):
         try:
             conn   = self._get_conn()
             cursor = conn.cursor()
             cursor.execute(
-                'INSERT OR IGNORE INTO unreachable_domains (domain, base_domain, log_source) VALUES (?, ?, ?)',
-                (domain, base_domain, "MANUAL_LOAD")
+                'INSERT OR IGNORE INTO unreachable_domains (domain, base_domain, status_code, log_source) VALUES (?, ?, ?, ?)',
+                (domain, base_domain, status_code, "MANUAL_LOAD")
             )
             conn.commit()
             return True
@@ -403,27 +403,52 @@ if not targets:
 
 # ==================== CHARGEMENT SUBDOMAINS MANUELS ====================
 def load_subdomains_from_file():
-    loaded = duplicates = 0
+    """
+    Charge subdomains.txt au démarrage.
+    Pour chaque nouveau sous-domaine :
+      - Fait un HTTP check immédiat pour connaitre son état réel
+      - Stocke en DB avec le status_code initial
+      - Le cron job prendra ensuite le relais toutes les 5 minutes
+    """
+    loaded = duplicates = skipped = 0
     if not os.path.exists(SUBDOMAINS_FILE):
         print(f"[INFO] {SUBDOMAINS_FILE} n'existe pas (optionnel)")
         return loaded, duplicates
     try:
         with open(SUBDOMAINS_FILE, 'r') as f:
             subdomains = [l.strip().lower() for l in f if l.strip() and not l.startswith('#')]
-        print(f"[LOAD] {len(subdomains)} sous-domaines à charger depuis {SUBDOMAINS_FILE}")
+
+        print(f"[LOAD] {len(subdomains)} sous-domaines dans {SUBDOMAINS_FILE}")
+
         for subdomain in subdomains:
             base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), None)
-            if base_domain:
-                if db.subdomain_exists(subdomain):
-                    duplicates += 1
-                else:
-                    db.add_subdomain_from_file(subdomain, base_domain)
-                    loaded += 1
-                    print(f"[LOAD] ✅ {subdomain}")
+
+            if not base_domain:
+                print(f"[LOAD] ❌ Domaine cible introuvable pour: {subdomain}")
+                skipped += 1
+                continue
+
+            if db.subdomain_exists(subdomain):
+                duplicates += 1
+                print(f"[LOAD] ⏭️  Déjà en DB: {subdomain}")
+                continue
+
+            # Check HTTP immédiat pour connaitre l'état réel dès le départ
+            print(f"[LOAD] 🔍 Check initial: {subdomain} ...")
+            status_code, response_time = check_domain(subdomain)
+
+            db.add_subdomain_from_file(subdomain, base_domain, status_code)
+            loaded += 1
+
+            status_str = str(status_code) if status_code else "timeout"
+            if status_code and 200 <= status_code < 400:
+                print(f"[LOAD] ✅ {subdomain} [{status_str}] — en ligne, surveillé")
             else:
-                print(f"[LOAD] ❌ Cible introuvable pour: {subdomain}")
-        print(f"[LOAD] Ajoutés: {loaded} | Doublons: {duplicates}\n")
+                print(f"[LOAD] 🔴 {subdomain} [{status_str}] — hors ligne, ajouté au monitoring")
+
+        print(f"\n[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB | {skipped} ignorés\n")
         return loaded, duplicates
+
     except Exception as e:
         print(f"[ERROR] Chargement subdomains: {e}")
         return 0, 0
@@ -481,7 +506,9 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
             if base:
                 by_base.setdefault(base, {'accessible': [], 'unreachable': []})
-                if status_code and status_code < 500:
+                # Accessible = 200 ou redirection 3xx
+                # Inaccessible = 4xx, 5xx, timeout (None)
+                if status_code and 200 <= status_code < 400:
                     by_base[base]['accessible'].append((domain, status_code))
                 else:
                     by_base[base]['unreachable'].append((domain, status_code))
@@ -493,12 +520,12 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             description += f"\n**{base}**\n"
             if data['accessible']:
                 total_accessible += len(data['accessible'])
-                description += "  ✅ Accessible:\n"
+                description += "  🟢 En ligne (2xx/3xx):\n"
                 for domain, status in data['accessible']:
                     description += f"    `{domain}` [{status}]\n"
             if data['unreachable']:
                 total_unreachable += len(data['unreachable'])
-                description += "  ❌ Inaccessible:\n"
+                description += "  🔴 Hors ligne (4xx/5xx/timeout):\n"
                 for domain, status in data['unreachable']:
                     description += f"    `{domain}` [{status if status else 'timeout'}]\n"
 
@@ -507,9 +534,9 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             "description": description,
             "color":       0xff8800,
             "fields": [
-                {"name": "✅ Accessible",   "value": str(total_accessible),  "inline": True},
-                {"name": "❌ Inaccessible", "value": str(total_unreachable), "inline": True},
-                {"name": "Source",          "value": log_name,               "inline": True},
+                {"name": "🟢 En ligne",          "value": str(total_accessible),  "inline": True},
+                {"name": "🔴 Hors ligne",         "value": str(total_unreachable), "inline": True},
+                {"name": "Source",                "value": log_name,               "inline": True},
             ],
             "footer":    {"text": "CT Monitor - Status Check Results"},
             "timestamp": datetime.utcnow().isoformat()
@@ -600,7 +627,11 @@ def parse_certificate(entry):
         try:
             san_ext = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
             for san in san_ext.value:
-                all_domains.add(san.value.lower().lstrip('*.'))
+                # Nettoyer proprement les wildcards *.domain.com → domain.com
+                raw = san.value.lower()
+                clean = raw.lstrip('*').lstrip('.')
+                if clean:
+                    all_domains.add(clean)
         except Exception:
             pass
 
@@ -676,8 +707,9 @@ def monitor_log(log_config):
 
     print(f"[{log_name}] Backlog: {backlog:,} entrées — traitement jusqu'à {max_batches * BATCH_SIZE:,}")
 
-    batches_done = 0
-    all_results  = []
+    batches_done  = 0
+    all_results   = []
+    seen_in_cycle = set()  # déduplication domaines dans ce cycle
 
     while current_pos < tree_size and batches_done < max_batches:
         end_pos = min(current_pos + BATCH_SIZE, tree_size)
@@ -717,14 +749,18 @@ def monitor_log(log_config):
                 stats['matches_trouvés'] += len(matched_domains)
 
             for domain in matched_domains:
+                if domain in seen_in_cycle:
+                    continue
+                seen_in_cycle.add(domain)
+
                 status_code, response_time = check_domain(domain)
                 with stats_lock:
                     stats['http_checks'] += 1
 
                 all_results.append((domain, status_code))
 
-                # Stocker en DB seulement si inaccessible (None = timeout, >=500 = erreur serveur)
-                if status_code is None or status_code >= 500:
+                # Stocker en DB si pas accessible (4xx, 5xx, timeout)
+                if status_code is None or status_code >= 400:
                     base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
                     if base:
                         db.add_unreachable(domain, base, status_code, log_name)
