@@ -633,16 +633,19 @@ WAF_BLOCK_BODY_SIGNATURES = [
     'checking your browser before accessing',
     'sucuri website firewall - access denied',
     'incapsula incident id',
+    '_incapsula_resource',
+    'incapsula_error',
     'mod_security',
     'request rejected',
     'forbidden by policy',
     'security policy violation',
+    'robots" content="noindex',
 ]
 
 def is_waf_block(response):
     # Detecte uniquement les pages de BLOCAGE WAF
     # Un site servi par Cloudflare avec vrai contenu → False
-    # Une page de blocage Cloudflare → True
+    # Une page de blocage Cloudflare/Incapsula → True
     headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
 
@@ -660,6 +663,10 @@ def is_waf_block(response):
         # Cloudflare JS challenge : page courte avec challenge/captcha
         if is_short and 'cloudflare' in body and ('challenge' in body or 'captcha' in body):
             return (True, "WAF block: cloudflare challenge")
+        
+        # Incapsula: page très courte avec Incapsula resource + robots noindex
+        if is_short and '_incapsula_resource' in body and 'noindex' in body:
+            return (True, "WAF block: incapsula")
 
     except Exception:
         pass
