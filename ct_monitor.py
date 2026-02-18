@@ -663,10 +663,11 @@ def cron_recheck_unreachable():
                 for domain, base_domain, last_check in unreachable:
                     status_code, response_time = check_domain(domain)
                     db.update_check(domain, status_code, response_time)
-                    if status_code == 200:
+                    # Alerte si retour en ligne (200 ou redirection 3xx)
+                    if status_code and 200 <= status_code < 400:
                         send_now_accessible_alert(domain)
                         db.mark_notified(domain)
-                        print(f"[CRON] ✅ {domain} est maintenant accessible!")
+                        print(f"[CRON] ✅ {domain} est maintenant accessible! [{status_code}]")
 
             path_monitor.check_all()
             time.sleep(UNREACHABLE_RECHECK_INTERVAL)
@@ -759,7 +760,8 @@ def monitor_log(log_config):
 
                 all_results.append((domain, status_code))
 
-                # Stocker en DB si pas accessible (4xx, 5xx, timeout)
+                # Stocker en DB tout ce qui n'est pas 200-3xx
+                # 4xx, 5xx, timeout = à monitorer jusqu'au retour en ligne
                 if status_code is None or status_code >= 400:
                     base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
                     if base:
@@ -790,12 +792,50 @@ def monitor_all_logs():
                 results[log_name] = -1
     return results
 
+# ==================== NETTOYAGE DB ====================
+def cleanup_db():
+    """
+    Supprime les entrées invalides en DB :
+    - Wildcards (*.domain) qui auraient été insérés par une ancienne version
+    - Domaines qui ne matchent plus aucune cible dans domains.txt
+    """
+    try:
+        conn   = db._get_conn()
+        cursor = conn.cursor()
+
+        # Supprimer les wildcards
+        cursor.execute("DELETE FROM unreachable_domains WHERE domain LIKE '*.%'")
+        wildcards_deleted = cursor.rowcount
+
+        # Supprimer les domaines qui ne matchent plus aucune cible
+        cursor.execute("SELECT domain FROM unreachable_domains")
+        all_domains = [row[0] for row in cursor.fetchall()]
+        orphans = [
+            d for d in all_domains
+            if not any(d == t or d.endswith('.' + t) for t in targets)
+        ]
+        for orphan in orphans:
+            cursor.execute("DELETE FROM unreachable_domains WHERE domain = ?", (orphan,))
+
+        conn.commit()
+
+        if wildcards_deleted > 0:
+            print(f"[DB CLEANUP] {wildcards_deleted} wildcard(s) supprimé(s)")
+        if orphans:
+            print(f"[DB CLEANUP] {len(orphans)} domaine(s) orphelin(s) supprimé(s): {orphans}")
+        if wildcards_deleted == 0 and not orphans:
+            print("[DB CLEANUP] Base propre, rien à nettoyer")
+
+    except Exception as e:
+        print(f"[DB CLEANUP ERROR] {e}")
+
 # ==================== DÉMARRAGE ====================
 print(f"\n[START] {NB_LOGS_ACTIFS} logs CT actifs")
 print(f"[START] {len(targets)} domaine(s) surveillés: {', '.join(sorted(targets))}")
 print(f"[START] Capacité: {BATCH_SIZE * MAX_BATCHES_CRITICAL:,} certs/log/cycle (CRITICAL)")
 print("=" * 80 + "\n")
 
+cleanup_db()
 loaded_count, duplicate_count = load_subdomains_from_file()
 print(f"[STARTUP] Subdomains chargés: {loaded_count} (doublons ignorés: {duplicate_count})\n")
 
