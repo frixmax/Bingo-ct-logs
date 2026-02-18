@@ -24,6 +24,14 @@ from cryptography.hazmat.backends import default_backend
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 
+# Thread-safe print — défini en premier car utilisé dès le démarrage
+import threading as _threading
+_print_lock = _threading.Lock()
+
+def tprint(msg):
+    with _print_lock:
+        print(msg)
+
 # Supprimer les warnings SSL (verify=False intentionnel)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -108,12 +116,6 @@ stats = {
     'precert_count':         0,
 }
 stats_lock  = threading.Lock()
-print_lock  = threading.Lock()
-
-def tprint(msg):
-    """Thread-safe print — évite les lignes mélangées dans les logs."""
-    with print_lock:
-        print(msg)
 
 # ==================== CACHE LRU ====================
 class LRUCache:
