@@ -459,7 +459,12 @@ AUTH_HTML_PATTERNS = [
     'login</title>',
     # Keycloak
     'kc-form-login',
+    'kc-page-title',
+    'kc-header',
+    '/keycloak/realms/',
     '/auth/realms/',
+    'class="login-pf"',
+    'login-pf-page',
     # OAuth2 generic
     'oauth2/authorize',
     'oauth/authorize',
