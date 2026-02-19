@@ -5,14 +5,3 @@ vodafone.it
 vodafone.cz
 vodafone.de
 vodafone.es
-tomtom.com
-tomtomgroup.com
-openai.org
-ford.com
-tiktok.com
-facebook.com
-whatsapp.com
-instagram.com
-messenger.com
-x.com
-twitter.com
