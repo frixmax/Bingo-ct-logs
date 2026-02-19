@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION v4.1 - PRODUCTION READY (Fix TypeError NoneType)
+CT Monitoring VPS - VERSION v4.2 - PRODUCTION READY (Fix Echo-Server False Positives)
 Corrections appliquées :
-- Gestion robuste du retour None de check_domain (évite le crash dans cron_recheck)
-- Logs plus clairs sur échecs retries
-- Logique identique à v4 pour le reste
+- v4.1: Gestion robuste du retour None de check_domain (évite le crash dans cron_recheck)
+- v4.2: Détection echo-server qui reflète les headers/metadata en JSON (faux positifs path scan)
 """
 import requests
 import json
@@ -38,7 +37,7 @@ def tprint(msg):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 tprint("=" * 100)
-tprint("CT MONITORING - VERSION v4.1 - PRODUCTION READY (Fixed NoneType unpack)")
+tprint("CT MONITORING - VERSION v4.2 - PRODUCTION READY (Fixed NoneType + Echo-Server FP)")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 tprint("=" * 100)
 
@@ -136,6 +135,7 @@ stats = {
     'retry_http': 0,
     'circuit_breaker_trips': 0,
     'last_vacuum': datetime.utcnow(),
+    'echo_server_blocked': 0,
 }
 stats_lock = threading.Lock()
 
@@ -713,12 +713,11 @@ def retry_with_backoff(func, max_retries=HTTP_CHECK_RETRIES, timeout_base=1):
         try:
             return func()
         except Exception as e:
-            # Log plus clair
             if attempt == max_retries - 1:
-                 tprint(f"[RETRY] All {max_retries} attempts failed.")
+                tprint(f"[RETRY] All {max_retries} attempts failed.")
             else:
-                 tprint(f"[RETRY] Attempt {attempt+1}/{max_retries} failed: {str(e)[:100]}")
-            
+                tprint(f"[RETRY] Attempt {attempt+1}/{max_retries} failed: {str(e)[:100]}")
+
             if attempt == max_retries - 1:
                 return None
             wait_time = timeout_base * (2 ** attempt)
@@ -726,6 +725,58 @@ def retry_with_backoff(func, max_retries=HTTP_CHECK_RETRIES, timeout_base=1):
                 stats['retry_http'] += 1
             time.sleep(wait_time)
     return None
+
+# ==================== ECHO-SERVER DETECTION (v4.2) ====================
+# Signatures caractéristiques d'un echo-server HTTP (retourne les métadonnées de la requête)
+ECHO_SERVER_REQUIRED_KEYS = {'path', 'headers', 'method'}
+ECHO_SERVER_STRONG_KEYS = {'hostname', 'os', 'connection', 'protocol', 'fresh', 'xhr', 'subdomains', 'ips'}
+ECHO_SERVER_HEADER_MARKERS = {'x-forwarded-for', 'x-real-ip', 'x-forwarded-proto', 'traceparent', 'x-request-id'}
+
+def is_echo_server_response(content: str, requested_path: str) -> tuple:
+    """
+    Détecte si la réponse JSON est en réalité un echo-server qui reflète
+    la requête entrante plutôt qu'un vrai fichier sensible.
+
+    Retourne (True, raison) si echo-server détecté, (False, None) sinon.
+    """
+    if not content:
+        return (False, None)
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return (False, None)
+
+    if not isinstance(data, dict):
+        return (False, None)
+
+    keys = set(data.keys())
+
+    # Critère fort : les 3 clés minimales d'un echo-server + au moins 2 clés secondaires
+    if ECHO_SERVER_REQUIRED_KEYS.issubset(keys):
+        strong_matches = keys & ECHO_SERVER_STRONG_KEYS
+        if len(strong_matches) >= 2:
+            return (True, f"echo-server: clés détectées {ECHO_SERVER_REQUIRED_KEYS | strong_matches}")
+
+    # Critère supplémentaire : le champ "path" dans la réponse correspond au path demandé
+    # (le serveur reflète littéralement le path de la requête)
+    if 'path' in data and 'headers' in data and isinstance(data.get('headers'), dict):
+        response_path = data.get('path', '')
+        if response_path == requested_path:
+            return (True, f"echo-server: path reflété '{response_path}' avec headers présents")
+
+    # Critère supplémentaire : les headers de la réponse contiennent des markers d'infrastructure interne
+    if isinstance(data.get('headers'), dict):
+        response_headers_keys = set(k.lower() for k in data['headers'].keys())
+        matching_markers = response_headers_keys & ECHO_SERVER_HEADER_MARKERS
+        if len(matching_markers) >= 2 and 'method' in keys:
+            return (True, f"echo-server: headers internes reflétés {matching_markers}")
+
+    # Critère : présence d'un champ "os" avec "hostname" (typique des echo-servers type Kubernetes)
+    if isinstance(data.get('os'), dict) and 'hostname' in data.get('os', {}):
+        if 'headers' in keys and 'method' in keys:
+            return (True, f"echo-server: os.hostname présent avec headers/method (pattern K8s echo)")
+
+    return (False, None)
 
 # ==================== FALSE POSITIVE DETECTION ====================
 PATH_CONTENT_EXPECTATIONS = {
@@ -749,6 +800,18 @@ PATH_CONTENT_EXPECTATIONS = {
 def check_content_coherence(body: str, path: str) -> tuple:
     path_low = path.lower()
     body_sample = body[:5000]
+
+    # ── Détection echo-server générique dans check_content_coherence ──
+    # Vérifie si le JSON contient la structure d'un echo-server même sans
+    # correspondance de path exact (détection complémentaire à is_echo_server_response)
+    try:
+        parsed_json = json.loads(body_sample)
+        if isinstance(parsed_json, dict):
+            if isinstance(parsed_json.get('headers'), dict) and 'method' in parsed_json and 'path' in parsed_json:
+                return (False, "echo-server: JSON reflète la requête entrante")
+    except (json.JSONDecodeError, ValueError):
+        pass
+
     for pattern, keywords in PATH_CONTENT_EXPECTATIONS.items():
         if pattern in path_low:
             found = [kw for kw in keywords if kw.lower() in body_sample.lower()]
@@ -833,7 +896,6 @@ def check_domain(domain: str) -> tuple | None:
         try:
             return future.result(timeout=HTTP_CHECK_TIMEOUT + 2)
         except Exception as e:
-            # tprint(f"[CHECK DOMAIN] Future timeout/failure pour {domain}: {str(e)}") # Trop verbeux
             return None
 
     result = retry_with_backoff(inner_check)
@@ -964,6 +1026,18 @@ class PathMonitor:
                 body_start = content.lstrip('\ufeff').lstrip()[:200].lower()
                 if body_start.startswith('<!doctype') or body_start.startswith('<html'):
                     return (403, None, response_time, "HTML body")
+
+                # ── CORRECTION v4.2 : Détection echo-server AVANT check_content_coherence ──
+                is_echo, echo_reason = is_echo_server_response(content, parsed_path)
+                if is_echo:
+                    domain = urlparse(url).netloc
+                    db.log_false_positive(domain, parsed_path, echo_reason)
+                    with stats_lock:
+                        stats['echo_server_blocked'] += 1
+                    tprint(f"[PATHS FP] Echo-server bloqué: {url} — {echo_reason}")
+                    return (403, None, response_time, f"False positive: {echo_reason}")
+                # ────────────────────────────────────────────────────────────────────────────
+
                 is_coherent, coherence_reason = check_content_coherence(content, parsed_path)
                 if not is_coherent:
                     return (403, None, response_time, f"Content mismatch: {coherence_reason}")
@@ -1049,6 +1123,10 @@ class PathMonitor:
         elapsed = int(time.time() - start)
         tprint(f"[PATHS CRON] Scan terminé — {domain_count} domaines en {elapsed}s")
         tprint(f"[PATHS CRON] Requetes: {total_checked} | erreurs: {total_errors}")
+        with stats_lock:
+            echo_blocked = stats['echo_server_blocked']
+        if echo_blocked > 0:
+            tprint(f"[PATHS CRON] 🛡️ {echo_blocked} echo-server(s) bloqué(s) (faux positifs)")
         if total_found > 0:
             tprint(f"[PATHS CRON] ⚠️ {total_found} fichier(s) sensible(s) trouvé(s) !")
         else:
@@ -1256,8 +1334,8 @@ def cron_recheck_unreachable():
                         break
                     for domain, base_domain, last_check in domains:
                         host, port = parse_subdomain_entry(domain)
-                        
-                        # CORRECTION: Gestion sécurisée du retour None
+
+                        # Gestion sécurisée du retour None (v4.1)
                         check_result = check_domain(host)
                         if check_result is None:
                             status_code = None
@@ -1265,7 +1343,7 @@ def cron_recheck_unreachable():
                             tprint(f"[CRON] ⚠️ Échec total check {domain} après retries")
                         else:
                             status_code, response_time = check_result
-                        
+
                         port_status = ""
                         if port:
                             port_open, _ = check_port(host, port)
@@ -1526,7 +1604,7 @@ if os.environ.get('DUMP_DB', '0') == '1':
 
 # ==================== DÉMARRAGE ====================
 tprint("[START] ================================================")
-tprint(f"[START] CT Monitor v4.1 - Production Ready (Fixed)")
+tprint(f"[START] CT Monitor v4.2 - Production Ready (Echo-Server FP Fixed)")
 tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s) surveillés")
 tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | Session keep-alive")
 tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History: {CHECK_HISTORY_RETENTION_DAYS}j")
@@ -1538,7 +1616,7 @@ db.purge_history()
 _s = db.stats_summary()
 tprint(f"[STARTUP] DB: {_s['total']} domaines | online={_s['online']} | {db.size_mb()} MB")
 
-tprint("[STARTUP] 2/3 — Chargement {SUBDOMAINS_FILE}...")
+tprint(f"[STARTUP] 2/3 — Chargement {SUBDOMAINS_FILE}...")
 if os.path.exists(SUBDOMAINS_FILE):
     loaded_count, dup_count = load_subdomains_from_file()
     tprint(f"[STARTUP] {loaded_count} ajouté(s), {dup_count} déjà en DB")
@@ -1584,6 +1662,7 @@ while True:
         tprint(f"[CYCLE #{cycle}] HTTP checks : {stats['http_checks']:,}")
         tprint(f"[CYCLE #{cycle}] Alertes envoyées : {stats['alertes_envoyées']:,}")
         tprint(f"[CYCLE #{cycle}] Duplicates évités : {stats['duplicates_évités']:,}")
+        tprint(f"[CYCLE #{cycle}] Echo-servers bloqués : {stats['echo_server_blocked']:,}")
         tprint(f"[CYCLE #{cycle}] Discord queue : {_discord_queue.qsize()} en attente | {stats['discord_dropped']} perdu(s)")
         tprint(f"[CYCLE #{cycle}] DB : {_s['total']} domaines | {db.size_mb()} MB")
         tprint(f"[CYCLE #{cycle}] DB detail : {_s['timeout']} timeout | {_s['4xx']} 4xx | {_s['5xx']} 5xx")
