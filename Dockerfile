@@ -1,23 +1,15 @@
 FROM python:3.11-slim
 WORKDIR /app
-# ── Dépendances système ──────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
-    curl \
-    gcc \
-    libssl-dev \
-    libffi-dev \
-    libpq-dev \
+    curl gcc libssl-dev libffi-dev libpq-dev \
     && rm -rf /var/lib/apt/lists/*
-# ── Dépendances Python : wheels pré-compilés en priorité (évite OOM au build) ─
 COPY requirements.txt .
 RUN pip install --upgrade pip --no-cache-dir \
  && pip install --no-cache-dir --prefer-binary -r requirements.txt
-# ── Fichiers applicatifs ─────────────────────────────────────────────────────
 COPY ct_monitor.py .
 COPY domains.txt .
-# Fichiers optionnels (créés vides s'ils n'existent pas)
-RUN touch /app/subdomains.txt /app/paths.txt
-# Répertoire de données persistant
+COPY subdomains.txt /app/data/subdomains.txt
+RUN touch /app/paths.txt
 RUN mkdir -p /app/data
 EXPOSE 10000
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
