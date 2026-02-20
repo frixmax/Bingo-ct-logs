@@ -2108,24 +2108,40 @@ def monitor_all_logs():
 
 # ==================== NETTOYAGE DB ====================
 def cleanup_db():
+    """
+    ✅ FIX v4.4.4: Utilise une table temporaire pour éviter
+    'Expression tree is too large' quand targets contient beaucoup de domaines.
+    """
     try:
-        conn   = db.get_conn()  # ✅ connexion fraîche
+        conn   = db.get_conn()
         cursor = conn.cursor()
+
+        # Supprime les wildcards
         cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
         wildcards_deleted = cursor.rowcount
+
         if targets:
-            conditions = []
-            params     = []
+            # ✅ Table temporaire au lieu d'une longue clause WHERE
+            cursor.execute("CREATE TEMPORARY TABLE IF NOT EXISTS _valid_targets (pattern TEXT)")
+            cursor.execute("DELETE FROM _valid_targets")
             for t in targets:
-                conditions.append("domain = ? OR domain LIKE ?")
-                params.extend([t, f'%.{t}'])
-            where_clause = " OR ".join(f"({c})" for c in conditions)
-            cursor.execute(f"DELETE FROM subdomains WHERE NOT ({where_clause})", params)
+                cursor.execute("INSERT INTO _valid_targets VALUES (?)", (t,))
+                cursor.execute("INSERT INTO _valid_targets VALUES (?)", (f'%.{t}',))
+
+            cursor.execute("""
+                DELETE FROM subdomains
+                WHERE domain NOT IN (
+                    SELECT s.domain FROM subdomains s
+                    JOIN _valid_targets vt ON s.domain LIKE vt.pattern
+                )
+            """)
             orphans_deleted = cursor.rowcount
+            cursor.execute("DROP TABLE IF EXISTS _valid_targets")
         else:
             orphans_deleted = 0
+
         conn.commit()
-        conn.close()  # ✅ FIX: libère le verrou immédiatement
+        conn.close()
         if wildcards_deleted > 0:
             tprint(f"[DB CLEANUP] {wildcards_deleted} wildcard(s) supprimé(s)")
         if orphans_deleted > 0:
