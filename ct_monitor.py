@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION v4.4.2 - PARALLEL EDITION + SUBDOMAINS FIX
-✅ DatabaseWriter centralisé (queue writes, zéro contention WAL)
-✅ JS Scanner parallélisé (ThreadPoolExecutor dédié)
-✅ Recheck offline parallélisé
-✅ Path scan collecte optimisée
-✅ Reads thread-local conservés (compatibles WAL)
-✅ Tous les locks/semaphores correctement propagés
-✅ Backward compatible avec v4.4.1 (même schéma DB, même config)
-✅ SUBDOMAINS_FILE déplacé dans /app/data/ (volume persistant Railway)
+CT Monitoring VPS - VERSION v4.4.3
+✅ Fix chargement subdomains (CRLF, BOM, encoding robuste)
+✅ SUBDOMAINS_FILE = /app/subdomains.txt (compatible Docker Compose ET Railway)
+✅ Fallback automatique vers /app/data/subdomains.txt
+✅ Ordre démarrage correct : cleanup DB → load subdomains → cron
+✅ DatabaseWriter centralisé
+✅ JS Scanner parallélisé
 ✅ Lookback CT logs augmenté (500k CRITICAL, 200k HIGH, 50k MEDIUM)
-✅ Indentation monitor_log() corrigée
 """
 import requests
 import json
@@ -40,14 +37,14 @@ from idna import encode as idna_encode, IDNAError
 _print_lock = threading.Lock()
 def tprint(msg):
     with _print_lock:
-        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}")
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-tprint("=" * 100)
-tprint("CT MONITORING - VERSION v4.4.2 - PARALLEL EDITION + SUBDOMAINS FIX")
+tprint("=" * 80)
+tprint("CT MONITORING - VERSION v4.4.3")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-tprint("=" * 100)
+tprint("=" * 80)
 
 # ==================== CONFIGURATION ====================
 DISCORD_WEBHOOK = os.environ.get('DISCORD_WEBHOOK', '')
@@ -57,22 +54,36 @@ DATA_DIR        = '/app/data'
 DATABASE_FILE   = f'{DATA_DIR}/ct_monitoring.db'
 POSITIONS_FILE  = f'{DATA_DIR}/ct_positions.json'
 POSITIONS_WAL   = f'{DATA_DIR}/ct_positions.json.wal'
-# ✅ FIX: SUBDOMAINS_FILE dans /app/data/ (volume persistant sur Railway)
-SUBDOMAINS_FILE = f'{DATA_DIR}/subdomains.txt'
 PATHS_FILE      = '/app/paths.txt'
 HEARTBEAT_FILE  = '/tmp/ct_monitor.heartbeat'
 
-os.makedirs(DATA_DIR, exist_ok=True)
+# ✅ FIX v4.4.3: Cherche subdomains.txt dans plusieurs emplacements
+# Priorité: /app/subdomains.txt (monté par Docker Compose/Dockerfile)
+# Fallback: /app/data/subdomains.txt (volume persistant Railway)
+def _find_subdomains_file():
+    candidates = [
+        '/app/subdomains.txt',
+        f'{DATA_DIR}/subdomains.txt',
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
+                    lines = [l.strip('\r\n').strip() for l in f
+                             if l.strip('\r\n').strip() and not l.strip().startswith('#')]
+                if lines:
+                    tprint(f"[CONFIG] subdomains.txt trouvé: {path} ({len(lines)} lignes)")
+                    return path
+                else:
+                    tprint(f"[CONFIG] {path} existe mais est vide — essai suivant")
+            except Exception as e:
+                tprint(f"[CONFIG] Erreur lecture {path}: {e}")
+    tprint(f"[CONFIG] Aucun subdomains.txt trouvé dans {candidates}")
+    return candidates[0]  # défaut
 
-# ✅ Migration automatique: si /app/subdomains.txt existe et /app/data/subdomains.txt non
-_old_subdomains = '/app/subdomains.txt'
-if os.path.exists(_old_subdomains) and not os.path.exists(SUBDOMAINS_FILE):
-    try:
-        import shutil
-        shutil.copy2(_old_subdomains, SUBDOMAINS_FILE)
-        tprint(f"[MIGRATION] {_old_subdomains} → {SUBDOMAINS_FILE}")
-    except Exception as _e:
-        tprint(f"[MIGRATION ERROR] {_e}")
+SUBDOMAINS_FILE = _find_subdomains_file()
+
+os.makedirs(DATA_DIR, exist_ok=True)
 
 CHECK_INTERVAL               = 30
 BATCH_SIZE                   = 500
@@ -93,14 +104,12 @@ TARGETS_RELOAD_INTERVAL      = 10
 MIN_CERTS_PER_CYCLE          = 100
 HTTP_CONCURRENCY_LIMIT       = 50
 
-# JS Scanner config
 JS_SCAN_TIMEOUT   = 8
 MAX_JS_SIZE       = 3 * 1024 * 1024
 MAX_JS_PER_DOMAIN = 20
 JS_SCAN_WORKERS   = 8
 JS_SCAN_INTERVAL  = 3600
 
-# DB Writer config
 DB_WRITE_QUEUE_SIZE    = 10000
 DB_WRITE_BATCH_TIMEOUT = 0.05
 
@@ -173,16 +182,10 @@ stats = {
     'js_domains_scanned':     0,
     'last_js_scan':           None,
     'js_false_positives':     0,
-    'js_false_negatives':     0,
     'db_write_queue_size':    0,
     'db_writes_processed':    0,
 }
 stats_lock = threading.Lock()
-
-_log_failures      = {}
-_log_failures_lock = threading.Lock()
-_log_requests_count  = {}
-_log_requests_lock   = threading.Lock()
 
 # ==================== CACHE LRU ====================
 class LRUCache:
@@ -337,25 +340,22 @@ def cleanup_sessions():
 
 weakref.finalize(_session_local, cleanup_sessions)
 
-# ==================== DATABASE WRITER CENTRALISÉ ====================
+# ==================== DATABASE WRITER ====================
 class _DBWriteOp:
     __slots__ = ('sql', 'params', 'result_future')
-
-    def __init__(self, sql: str, params: tuple, result_future=None):
-        self.sql            = sql
-        self.params         = params
-        self.result_future  = result_future
+    def __init__(self, sql, params, result_future=None):
+        self.sql           = sql
+        self.params        = params
+        self.result_future = result_future
 
 _SENTINEL = object()
 
 class DatabaseWriter:
-    def __init__(self, db_path: str, queue_size: int = DB_WRITE_QUEUE_SIZE):
-        self._queue    = queue.Queue(maxsize=queue_size)
-        self._conn     = None
-        self._db_path  = db_path
-        self._thread   = threading.Thread(
-            target=self._run, daemon=True, name="DBWriter"
-        )
+    def __init__(self, db_path, queue_size=DB_WRITE_QUEUE_SIZE):
+        self._queue   = queue.Queue(maxsize=queue_size)
+        self._conn    = None
+        self._db_path = db_path
+        self._thread  = threading.Thread(target=self._run, daemon=True, name="DBWriter")
         self._thread.start()
 
     def _open_conn(self):
@@ -367,36 +367,31 @@ class DatabaseWriter:
         return conn
 
     def _run(self):
-        self._conn = self._open_conn()
-        batch = []
+        self._conn  = self._open_conn()
+        batch       = []
         last_commit = time.monotonic()
-
         while True:
             try:
                 op = self._queue.get(timeout=DB_WRITE_BATCH_TIMEOUT)
             except queue.Empty:
                 op = None
-
             if op is _SENTINEL:
                 if batch:
                     self._flush(batch)
-                    batch = []
                 self._conn.close()
                 return
-
             if op is not None:
                 batch.append(op)
                 self._queue.task_done()
-
             now = time.monotonic()
             if batch and (len(batch) >= 200 or (now - last_commit) >= 0.2 or op is None):
                 self._flush(batch)
-                batch = []
+                batch       = []
                 last_commit = now
 
-    def _flush(self, batch: list):
+    def _flush(self, batch):
         try:
-            cursor = self._conn.cursor()
+            cursor          = self._conn.cursor()
             errors_in_batch = 0
             for op in batch:
                 try:
@@ -406,7 +401,7 @@ class DatabaseWriter:
                 except Exception as e:
                     errors_in_batch += 1
                     if errors_in_batch == 1:
-                        tprint(f"[DB WRITER] Erreur op: {e} — SQL: {op.sql[:60]}")
+                        tprint(f"[DB WRITER] Erreur: {e} — SQL: {op.sql[:60]}")
                 finally:
                     if op.result_future:
                         op.result_future.set()
@@ -416,13 +411,12 @@ class DatabaseWriter:
                 stats['db_write_queue_size']  = self._queue.qsize()
         except Exception as e:
             tprint(f"[DB WRITER] Erreur flush: {e}")
-            traceback.print_exc()
             try:
                 self._conn.rollback()
             except Exception:
                 pass
 
-    def execute(self, sql: str, params: tuple = (), wait: bool = False):
+    def execute(self, sql, params=(), wait=False):
         ev = threading.Event() if wait else None
         op = _DBWriteOp(sql, params, ev)
         try:
@@ -437,14 +431,12 @@ class DatabaseWriter:
         self._queue.put(_SENTINEL)
         self._thread.join(timeout=10)
 
-
 # ==================== DATABASE ====================
 class CertificateDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._local  = threading.local()
-        self._writer: DatabaseWriter | None = None
-        self._init_writer_lock = threading.Lock()
+        self._writer = None
         self.init_db()
         self._writer = DatabaseWriter(db_path)
         tprint("[DB] DatabaseWriter démarré")
@@ -471,101 +463,79 @@ class CertificateDatabase:
     def init_db(self):
         conn   = self.get_conn()
         cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS subdomains (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain      TEXT UNIQUE NOT NULL,
-                base_domain TEXT NOT NULL,
-                status_code INTEGER,
-                is_online   BOOLEAN DEFAULT 0,
-                first_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_check  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                log_source  TEXT
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS check_history (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain           TEXT NOT NULL,
-                status_code      INTEGER,
-                response_time_ms INTEGER,
-                check_timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS false_positives (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain    TEXT NOT NULL,
-                path      TEXT,
-                reason    TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS anomalies (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                cert_hash    TEXT NOT NULL,
-                anomaly_type TEXT,
-                detail       TEXT,
-                timestamp    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS js_secrets (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain       TEXT NOT NULL,
-                js_url       TEXT NOT NULL,
-                secret_type  TEXT NOT NULL,
-                secret_value TEXT NOT NULL,
-                context      TEXT,
-                confidence   INTEGER DEFAULT 50,
-                notified     BOOLEAN DEFAULT 0,
-                timestamp    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(js_url, secret_type, secret_value)
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS js_scan_history (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                js_url        TEXT UNIQUE NOT NULL,
-                content_hash  TEXT,
-                last_scan     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                secrets_found INTEGER DEFAULT 0
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS js_false_positives (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                domain       TEXT NOT NULL,
-                js_url       TEXT NOT NULL,
-                secret_type  TEXT NOT NULL,
-                secret_value TEXT NOT NULL,
-                reason       TEXT,
-                timestamp    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS subdomains (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT UNIQUE NOT NULL,
+            base_domain TEXT NOT NULL,
+            status_code INTEGER,
+            is_online BOOLEAN DEFAULT 0,
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            log_source TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS check_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            status_code INTEGER,
+            response_time_ms INTEGER,
+            check_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS false_positives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            path TEXT,
+            reason TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS anomalies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cert_hash TEXT NOT NULL,
+            anomaly_type TEXT,
+            detail TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS js_secrets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            js_url TEXT NOT NULL,
+            secret_type TEXT NOT NULL,
+            secret_value TEXT NOT NULL,
+            context TEXT,
+            confidence INTEGER DEFAULT 50,
+            notified BOOLEAN DEFAULT 0,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(js_url, secret_type, secret_value))''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS js_scan_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            js_url TEXT UNIQUE NOT NULL,
+            content_hash TEXT,
+            last_scan TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            secrets_found INTEGER DEFAULT 0)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS js_false_positives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            js_url TEXT NOT NULL,
+            secret_type TEXT NOT NULL,
+            secret_value TEXT NOT NULL,
+            reason TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
+        # Migration
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='unreachable_domains'")
         if cursor.fetchone():
-            cursor.execute('''
-                INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, first_seen, last_check, log_source)
+            cursor.execute('''INSERT OR IGNORE INTO subdomains
+                (domain, base_domain, status_code, is_online, first_seen, last_check, log_source)
                 SELECT domain, base_domain, status_code, 0, first_seen, last_check, log_source
-                FROM unreachable_domains
-            ''')
+                FROM unreachable_domains''')
             cursor.execute('DROP TABLE unreachable_domains')
             tprint("[DB] Migration unreachable_domains → subdomains effectuée")
 
-        def _add_column_if_missing(table: str, column: str, col_def: str):
+        def _add_col(table, col, col_def):
             cursor.execute(f'PRAGMA table_info({table})')
-            existing_cols = {row[1] for row in cursor.fetchall()}
-            if column not in existing_cols:
-                cursor.execute(f'ALTER TABLE {table} ADD COLUMN {column} {col_def}')
-                tprint(f"[DB MIGRATION] ALTER TABLE {table} ADD COLUMN {column}")
+            if col not in {r[1] for r in cursor.fetchall()}:
+                cursor.execute(f'ALTER TABLE {table} ADD COLUMN {col} {col_def}')
+                tprint(f"[DB] ALTER TABLE {table} ADD COLUMN {col}")
 
-        _add_column_if_missing('js_secrets', 'confidence',  'INTEGER DEFAULT 50')
-        _add_column_if_missing('js_secrets', 'notified',    'BOOLEAN DEFAULT 0')
-        _add_column_if_missing('js_secrets', 'context',     'TEXT')
-        _add_column_if_missing('subdomains', 'log_source',  'TEXT')
+        _add_col('js_secrets', 'confidence', 'INTEGER DEFAULT 50')
+        _add_col('js_secrets', 'notified',   'BOOLEAN DEFAULT 0')
+        _add_col('js_secrets', 'context',    'TEXT')
+        _add_col('subdomains', 'log_source', 'TEXT')
 
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain ON subdomains(domain)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_check ON subdomains(last_check)')
@@ -580,33 +550,30 @@ class CertificateDatabase:
         conn.commit()
         tprint(f"[DB] Initialisée: {self.db_path}")
 
-    def subdomain_exists(self, domain) -> bool:
+    def subdomain_exists(self, domain):
         try:
             cursor = self._get_read_conn().cursor()
-            cursor.execute('SELECT 1 FROM subdomains WHERE domain = ? LIMIT 1', (domain,))
+            cursor.execute('SELECT 1 FROM subdomains WHERE domain=? LIMIT 1', (domain,))
             return cursor.fetchone() is not None
         except Exception as e:
             tprint(f"[DB ERROR] subdomain_exists: {e}")
             return False
 
-    def add_domain(self, domain, base_domain, status_code, log_source) -> bool:
+    def add_domain(self, domain, base_domain, status_code, log_source):
         is_online = 1 if status_code == 200 else 0
         try:
             cursor = self._get_read_conn().cursor()
-            cursor.execute('SELECT 1 FROM subdomains WHERE domain = ? LIMIT 1', (domain,))
+            cursor.execute('SELECT 1 FROM subdomains WHERE domain=? LIMIT 1', (domain,))
             exists = cursor.fetchone() is not None
-
             if exists:
                 self._writer.execute(
-                    'UPDATE subdomains SET status_code=?, is_online=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
-                    (status_code, is_online, domain)
-                )
+                    'UPDATE subdomains SET status_code=?,is_online=?,last_check=CURRENT_TIMESTAMP WHERE domain=?',
+                    (status_code, is_online, domain))
                 return False
             else:
                 self._writer.execute(
-                    'INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?,?,?,?,?)',
-                    (domain, base_domain, status_code, is_online, log_source)
-                )
+                    'INSERT OR IGNORE INTO subdomains (domain,base_domain,status_code,is_online,log_source) VALUES(?,?,?,?,?)',
+                    (domain, base_domain, status_code, is_online, log_source))
                 return True
         except Exception as e:
             tprint(f"[DB ERROR] add_domain {domain}: {e}")
@@ -615,88 +582,64 @@ class CertificateDatabase:
     def add_subdomain_from_file(self, domain, base_domain, status_code=None):
         is_online = 1 if status_code == 200 else 0
         self._writer.execute(
-            'INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?,?,?,?,?)',
-            (domain, base_domain, status_code, is_online, "MANUAL_LOAD")
-        )
+            'INSERT OR IGNORE INTO subdomains (domain,base_domain,status_code,is_online,log_source) VALUES(?,?,?,?,?)',
+            (domain, base_domain, status_code, is_online, "MANUAL_LOAD"))
         return True
 
     def log_false_positive(self, domain, path, reason):
-        self._writer.execute(
-            'INSERT INTO false_positives (domain, path, reason) VALUES (?,?,?)',
-            (domain, path, reason)
-        )
+        self._writer.execute('INSERT INTO false_positives (domain,path,reason) VALUES(?,?,?)', (domain, path, reason))
         with stats_lock:
             stats['false_positives'] += 1
 
     def log_js_false_positive(self, domain, js_url, secret_type, secret_value, reason):
         self._writer.execute(
-            'INSERT INTO js_false_positives (domain, js_url, secret_type, secret_value, reason) VALUES (?,?,?,?,?)',
-            (domain, js_url, secret_type, secret_value[:120], reason)
-        )
+            'INSERT INTO js_false_positives (domain,js_url,secret_type,secret_value,reason) VALUES(?,?,?,?,?)',
+            (domain, js_url, secret_type, secret_value[:120], reason))
         with stats_lock:
             stats['js_false_positives'] += 1
 
     def log_anomaly(self, cert_hash, anomaly_type, detail):
-        self._writer.execute(
-            'INSERT INTO anomalies (cert_hash, anomaly_type, detail) VALUES (?,?,?)',
-            (cert_hash, anomaly_type, detail)
-        )
+        self._writer.execute('INSERT INTO anomalies (cert_hash,anomaly_type,detail) VALUES(?,?,?)',
+                             (cert_hash, anomaly_type, detail))
 
-    def save_js_secret(self, domain, js_url, secret_type, secret_value, context, confidence=50) -> bool:
+    def save_js_secret(self, domain, js_url, secret_type, secret_value, context, confidence=50):
         try:
             cursor = self._get_read_conn().cursor()
-            cursor.execute(
-                'SELECT 1 FROM js_secrets WHERE js_url=? AND secret_type=? AND secret_value=? LIMIT 1',
-                (js_url, secret_type, secret_value[:500])
-            )
+            cursor.execute('SELECT 1 FROM js_secrets WHERE js_url=? AND secret_type=? AND secret_value=? LIMIT 1',
+                           (js_url, secret_type, secret_value[:500]))
             if cursor.fetchone():
                 return False
             self._writer.execute(
-                '''INSERT OR IGNORE INTO js_secrets
-                   (domain, js_url, secret_type, secret_value, context, confidence)
-                   VALUES (?,?,?,?,?,?)''',
-                (domain, js_url, secret_type, secret_value[:500], context[:500] if context else '', confidence)
-            )
+                'INSERT OR IGNORE INTO js_secrets (domain,js_url,secret_type,secret_value,context,confidence) VALUES(?,?,?,?,?,?)',
+                (domain, js_url, secret_type, secret_value[:500], context[:500] if context else '', confidence))
             return True
         except Exception as e:
             tprint(f"[DB ERROR] save_js_secret: {e}")
             return False
 
-    def get_js_scan_history(self, js_url) -> dict | None:
+    def get_js_scan_history(self, js_url):
         try:
             cursor = self._get_read_conn().cursor()
-            cursor.execute(
-                'SELECT content_hash, last_scan, secrets_found FROM js_scan_history WHERE js_url=?',
-                (js_url,)
-            )
+            cursor.execute('SELECT content_hash,last_scan,secrets_found FROM js_scan_history WHERE js_url=?', (js_url,))
             row = cursor.fetchone()
-            if row:
-                return {'content_hash': row[0], 'last_scan': row[1], 'secrets_found': row[2]}
-            return None
+            return {'content_hash': row[0], 'last_scan': row[1], 'secrets_found': row[2]} if row else None
         except Exception:
             return None
 
     def update_js_scan_history(self, js_url, content_hash, secrets_found):
         self._writer.execute(
-            '''INSERT INTO js_scan_history (js_url, content_hash, secrets_found)
-               VALUES (?,?,?)
+            '''INSERT INTO js_scan_history (js_url,content_hash,secrets_found) VALUES(?,?,?)
                ON CONFLICT(js_url) DO UPDATE SET
-                   content_hash=excluded.content_hash,
-                   secrets_found=excluded.secrets_found,
-                   last_scan=CURRENT_TIMESTAMP''',
-            (js_url, content_hash, secrets_found)
-        )
+               content_hash=excluded.content_hash,
+               secrets_found=excluded.secrets_found,
+               last_scan=CURRENT_TIMESTAMP''',
+            (js_url, content_hash, secrets_found))
 
     def get_offline(self, limit=100, offset=0):
         try:
             cursor = self._get_read_conn().cursor()
-            cursor.execute('''
-                SELECT domain, base_domain, last_check
-                FROM subdomains
-                WHERE is_online = 0
-                ORDER BY last_check ASC NULLS FIRST
-                LIMIT ? OFFSET ?
-            ''', (limit, offset))
+            cursor.execute('''SELECT domain,base_domain,last_check FROM subdomains
+                WHERE is_online=0 ORDER BY last_check ASC NULLS FIRST LIMIT ? OFFSET ?''', (limit, offset))
             return cursor.fetchall()
         except Exception as e:
             tprint(f"[DB ERROR] get_offline: {e}")
@@ -705,7 +648,7 @@ class CertificateDatabase:
     def count_offline(self):
         try:
             cursor = self._get_read_conn().cursor()
-            cursor.execute('SELECT COUNT(*) FROM subdomains WHERE is_online = 0')
+            cursor.execute('SELECT COUNT(*) FROM subdomains WHERE is_online=0')
             return cursor.fetchone()[0]
         except Exception:
             return 0
@@ -715,10 +658,7 @@ class CertificateDatabase:
         while True:
             try:
                 cursor = self._get_read_conn().cursor()
-                cursor.execute(
-                    'SELECT domain FROM subdomains ORDER BY domain LIMIT ? OFFSET ?',
-                    (page_size, offset)
-                )
+                cursor.execute('SELECT domain FROM subdomains ORDER BY domain LIMIT ? OFFSET ?', (page_size, offset))
                 rows = cursor.fetchall()
                 if not rows:
                     break
@@ -734,10 +674,8 @@ class CertificateDatabase:
         while True:
             try:
                 cursor = self._get_read_conn().cursor()
-                cursor.execute(
-                    'SELECT domain FROM subdomains WHERE is_online=1 ORDER BY domain LIMIT ? OFFSET ?',
-                    (page_size, offset)
-                )
+                cursor.execute('SELECT domain FROM subdomains WHERE is_online=1 ORDER BY domain LIMIT ? OFFSET ?',
+                               (page_size, offset))
                 rows = cursor.fetchall()
                 if not rows:
                     break
@@ -754,28 +692,22 @@ class CertificateDatabase:
     def update_check(self, domain, status_code, response_time_ms):
         is_online = 1 if status_code == 200 else 0
         self._writer.execute(
-            'UPDATE subdomains SET status_code=?, is_online=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
-            (status_code, is_online, domain)
-        )
+            'UPDATE subdomains SET status_code=?,is_online=?,last_check=CURRENT_TIMESTAMP WHERE domain=?',
+            (status_code, is_online, domain))
         self._writer.execute(
-            'INSERT INTO check_history (domain, status_code, response_time_ms) VALUES (?,?,?)',
-            (domain, status_code, response_time_ms)
-        )
-        return True
+            'INSERT INTO check_history (domain,status_code,response_time_ms) VALUES(?,?,?)',
+            (domain, status_code, response_time_ms))
 
     def mark_online(self, domain, status_code):
         self._writer.execute(
-            'UPDATE subdomains SET is_online=1, status_code=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
-            (status_code, domain)
-        )
+            'UPDATE subdomains SET is_online=1,status_code=?,last_check=CURRENT_TIMESTAMP WHERE domain=?',
+            (status_code, domain))
 
     def purge_history(self, retention_days=CHECK_HISTORY_RETENTION_DAYS):
         self._writer.execute(
             "DELETE FROM check_history WHERE check_timestamp < datetime('now', ? || ' days')",
-            (f'-{retention_days}',)
-        )
+            (f'-{retention_days}',))
         tprint(f"[DB PURGE] Purge historique > {retention_days}j soumise")
-        return 0
 
     def vacuum_optimize(self):
         try:
@@ -803,23 +735,16 @@ class CertificateDatabase:
     def stats_summary(self):
         try:
             cursor = self._get_read_conn().cursor()
-            cursor.execute('''
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN is_online=1 THEN 1 ELSE 0 END) as online,
-                    SUM(CASE WHEN is_online=0 AND status_code IS NULL THEN 1 ELSE 0 END) as timeouts,
-                    SUM(CASE WHEN status_code>=400 AND status_code<500 THEN 1 ELSE 0 END) as errors_4xx,
-                    SUM(CASE WHEN status_code>=500 THEN 1 ELSE 0 END) as errors_5xx
-                FROM subdomains
-            ''')
+            cursor.execute('''SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN is_online=1 THEN 1 ELSE 0 END) as online,
+                SUM(CASE WHEN is_online=0 AND status_code IS NULL THEN 1 ELSE 0 END) as timeouts,
+                SUM(CASE WHEN status_code>=400 AND status_code<500 THEN 1 ELSE 0 END) as errors_4xx,
+                SUM(CASE WHEN status_code>=500 THEN 1 ELSE 0 END) as errors_5xx
+                FROM subdomains''')
             row = cursor.fetchone()
-            return {
-                'total':   row[0] or 0,
-                'online':  row[1] or 0,
-                'timeout': row[2] or 0,
-                '4xx':     row[3] or 0,
-                '5xx':     row[4] or 0,
-            }
+            return {'total': row[0] or 0, 'online': row[1] or 0,
+                    'timeout': row[2] or 0, '4xx': row[3] or 0, '5xx': row[4] or 0}
         except Exception:
             return {'total': 0, 'online': 0, 'timeout': 0, '4xx': 0, '5xx': 0}
 
@@ -828,6 +753,8 @@ db = CertificateDatabase(DATABASE_FILE)
 # ==================== DOMAIN VALIDATION ====================
 def validate_domain(domain: str) -> bool:
     domain = domain.lower().strip()
+    if not domain:
+        return False
     if domain.startswith('.') or domain.endswith('.'):
         return False
     if domain.startswith('*.'):
@@ -865,9 +792,9 @@ def save_positions():
         with open(tmp_file, 'w') as f:
             json.dump(positions_copy, f, indent=2)
         try:
-            f_tmp = os.open(tmp_file, os.O_RDONLY)
-            os.fsync(f_tmp)
-            os.close(f_tmp)
+            fd = os.open(tmp_file, os.O_RDONLY)
+            os.fsync(fd)
+            os.close(fd)
         except Exception:
             pass
         os.replace(tmp_file, POSITIONS_FILE)
@@ -932,13 +859,10 @@ def retry_with_backoff(func, max_retries=HTTP_CHECK_RETRIES, timeout_base=1):
             return func()
         except Exception as e:
             if attempt < max_retries - 1:
-                tprint(f"[RETRY] Attempt {attempt+1}/{max_retries} failed: {str(e)[:100]}")
                 wait_time = timeout_base * (2 ** attempt)
                 with stats_lock:
                     stats['retry_http'] += 1
                 time.sleep(wait_time)
-            else:
-                tprint(f"[RETRY] All {max_retries} attempts failed.")
     return None
 
 # ==================== ECHO-SERVER DETECTION ====================
@@ -946,7 +870,7 @@ ECHO_SERVER_REQUIRED_KEYS  = {'path', 'headers', 'method'}
 ECHO_SERVER_STRONG_KEYS    = {'hostname', 'os', 'connection', 'protocol', 'fresh', 'xhr', 'subdomains', 'ips'}
 ECHO_SERVER_HEADER_MARKERS = {'x-forwarded-for', 'x-real-ip', 'x-forwarded-proto', 'traceparent', 'x-request-id'}
 
-def is_echo_server_response(content: str, requested_path: str) -> tuple:
+def is_echo_server_response(content, requested_path):
     if not content:
         return (False, None)
     try:
@@ -959,19 +883,18 @@ def is_echo_server_response(content: str, requested_path: str) -> tuple:
     if ECHO_SERVER_REQUIRED_KEYS.issubset(keys):
         strong_matches = keys & ECHO_SERVER_STRONG_KEYS
         if len(strong_matches) >= 2:
-            return (True, f"echo-server: clés détectées {ECHO_SERVER_REQUIRED_KEYS | strong_matches}")
+            return (True, f"echo-server: clés {ECHO_SERVER_REQUIRED_KEYS | strong_matches}")
     if 'path' in data and 'headers' in data and isinstance(data.get('headers'), dict):
-        response_path = data.get('path', '')
-        if response_path == requested_path:
-            return (True, f"echo-server: path reflété '{response_path}'")
+        if data.get('path', '') == requested_path:
+            return (True, f"echo-server: path reflété '{requested_path}'")
     if isinstance(data.get('headers'), dict):
-        response_headers_keys = set(k.lower() for k in data['headers'].keys())
-        matching_markers = response_headers_keys & ECHO_SERVER_HEADER_MARKERS
-        if len(matching_markers) >= 2 and 'method' in keys:
-            return (True, f"echo-server: headers internes reflétés {matching_markers}")
+        rh = set(k.lower() for k in data['headers'].keys())
+        matching = rh & ECHO_SERVER_HEADER_MARKERS
+        if len(matching) >= 2 and 'method' in keys:
+            return (True, f"echo-server: headers reflétés {matching}")
     if isinstance(data.get('os'), dict) and 'hostname' in data.get('os', {}):
         if 'headers' in keys and 'method' in keys:
-            return (True, "echo-server: os.hostname présent (pattern K8s)")
+            return (True, "echo-server: os.hostname (K8s)")
     return (False, None)
 
 # ==================== FALSE POSITIVE DETECTION ====================
@@ -993,21 +916,21 @@ PATH_CONTENT_EXPECTATIONS = {
     'phpmyadmin':      ['phpMyAdmin', 'pma_', 'PMA_'],
 }
 
-def check_content_coherence(body: str, path: str) -> tuple:
+def check_content_coherence(body, path):
     path_low    = path.lower()
     body_sample = body[:5000]
     try:
         parsed_json = json.loads(body_sample)
         if isinstance(parsed_json, dict):
             if isinstance(parsed_json.get('headers'), dict) and 'method' in parsed_json and 'path' in parsed_json:
-                return (False, "echo-server: JSON reflète la requête entrante")
+                return (False, "echo-server JSON")
     except (json.JSONDecodeError, ValueError):
         pass
     for pattern, keywords in PATH_CONTENT_EXPECTATIONS.items():
         if pattern in path_low:
             found = [kw for kw in keywords if kw.lower() in body_sample.lower()]
             if not found:
-                return (False, f"path '{pattern}' expects {keywords[:3]}... none found")
+                return (False, f"path '{pattern}' expects {keywords[:3]}...")
             return (True, f"found: {found[:2]}")
     return (True, "no_rule")
 
@@ -1022,7 +945,7 @@ WAF_BLOCK_BODY_SIGNATURES = [
     'not found', 'endpoint not found', 'resource not found',
 ]
 
-def is_waf_block(response) -> tuple:
+def is_waf_block(response):
     headers      = {k.lower(): v.lower() for k, v in response.headers.items()}
     content_type = headers.get('content-type', '')
     if 'text/html' not in content_type:
@@ -1043,23 +966,18 @@ def is_waf_block(response) -> tuple:
     return (False, None)
 
 # ==================== HTTP CHECKER ====================
-def _do_check_domain(domain: str) -> tuple:
-    MAX_REDIRECTS = 5
-    session       = get_session()
+def _do_check_domain(domain):
+    session = get_session()
     for protocol in ['https', 'http']:
         try:
             with _http_semaphore:
                 start    = time.time()
-                response = session.get(
-                    f"{protocol}://{domain}",
-                    timeout=HTTP_CHECK_TIMEOUT,
-                    allow_redirects=True,
-                    stream=False
-                )
+                response = session.get(f"{protocol}://{domain}", timeout=HTTP_CHECK_TIMEOUT,
+                                       allow_redirects=True, stream=False)
             elapsed       = int((time.time() - start) * 1000)
             requested_url = f"{protocol}://{domain}"
             if response.url != requested_url and response.url.lower() != f"{protocol}://{domain.lower()}/":
-                if len(response.history) > MAX_REDIRECTS:
+                if len(response.history) > 5:
                     return (403, elapsed)
                 original_domain = urlparse(requested_url).netloc
                 redirect_domain = urlparse(response.url).netloc
@@ -1069,7 +987,7 @@ def _do_check_domain(domain: str) -> tuple:
                 content_type = response.headers.get('Content-Type', '').lower()
                 if content_type and 'text/html' not in content_type and 'application/json' not in content_type:
                     return (403, elapsed)
-                waf, reason = is_waf_block(response)
+                waf, _ = is_waf_block(response)
                 if waf:
                     return (403, elapsed)
                 return (200, elapsed)
@@ -1080,18 +998,14 @@ def _do_check_domain(domain: str) -> tuple:
             continue
     return (None, None)
 
-def check_domain(domain: str) -> tuple | None:
-    def inner_check():
+def check_domain(domain):
+    def inner():
         future = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
         try:
             return future.result(timeout=HTTP_CHECK_TIMEOUT + 2)
         except Exception:
             return None
-    result = retry_with_backoff(inner_check)
-    if result is None:
-        tprint(f"[HTTP CHECK] Échec total après {HTTP_CHECK_RETRIES} tentatives pour {domain}")
-        return None
-    return result
+    return retry_with_backoff(inner)
 
 def check_port(host, port, timeout=10):
     try:
@@ -1116,8 +1030,9 @@ def parse_subdomain_entry(entry):
 # ==================== LOAD TARGET DOMAINS ====================
 def load_targets():
     try:
-        with open(DOMAINS_FILE, 'r') as f:
-            raw_domains = {line.strip().lower() for line in f if line.strip() and not line.startswith('#')}
+        with open(DOMAINS_FILE, 'r', encoding='utf-8-sig', errors='replace') as f:
+            raw_domains = {line.strip('\r\n').strip().lower() for line in f
+                           if line.strip('\r\n').strip() and not line.strip().startswith('#')}
         valid   = set()
         invalid = []
         for domain in raw_domains:
@@ -1126,11 +1041,11 @@ def load_targets():
             else:
                 invalid.append(domain)
         if invalid:
-            tprint(f"[WARN] {len(invalid)} domaines invalides: {invalid[:5]}...")
+            tprint(f"[WARN] {len(invalid)} domaines invalides: {invalid[:5]}")
         if not valid:
             tprint("[ERROR] Aucun domaine valide — arrêt")
             exit(1)
-        tprint(f"[OK] {len(valid)} domaines chargés")
+        tprint(f"[OK] {len(valid)} domaines chargés: {sorted(valid)}")
         return valid
     except Exception as e:
         tprint(f"[ERROR] Chargement domaines: {e}")
@@ -1155,8 +1070,9 @@ class PathMonitor:
             tprint(f"[PATHS] {self.paths_file} absent — {len(self.paths)} paths par défaut")
             return
         try:
-            with open(self.paths_file, 'r') as f:
-                custom = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+            with open(self.paths_file, 'r', encoding='utf-8-sig', errors='replace') as f:
+                custom = [l.strip('\r\n').strip() for l in f
+                          if l.strip('\r\n').strip() and not l.strip().startswith('#')]
             for p in custom:
                 if p not in self.paths:
                     self.paths.append(p)
@@ -1164,7 +1080,7 @@ class PathMonitor:
         except Exception as e:
             tprint(f"[PATHS ERROR] {e}")
 
-    def check_path(self, url: str) -> tuple:
+    def check_path(self, url):
         MAX_CONTENT_SIZE = 5 * 1024 * 1024
         parsed_path      = urlparse(url).path
         session          = get_session()
@@ -1184,13 +1100,6 @@ class PathMonitor:
                     response.close()
                     return (403, None, response_time, f"Invalid Content-Type: {content_type}")
                 try:
-                    size = int(response.headers.get('Content-Length', '0'))
-                    if size > MAX_CONTENT_SIZE:
-                        response.close()
-                        return (403, None, response_time, f"Content too large ({size})")
-                except Exception:
-                    pass
-                try:
                     chunks = []
                     total  = 0
                     for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
@@ -1204,9 +1113,9 @@ class PathMonitor:
                     response.close()
                 except Exception as e:
                     response.close()
-                    return (None, None, response_time, f"Error reading body: {str(e)[:50]}")
+                    return (None, None, response_time, str(e)[:50])
                 if not content or len(content) <= 200:
-                    return (403, None, response_time, f"Content too small ({len(content)} bytes)")
+                    return (403, None, response_time, f"Too small ({len(content)} bytes)")
                 body_start = content.lstrip('\ufeff').lstrip()[:200].lower()
                 if body_start.startswith('<!doctype') or body_start.startswith('<html'):
                     return (403, None, response_time, "HTML body")
@@ -1216,11 +1125,10 @@ class PathMonitor:
                     db.log_false_positive(domain, parsed_path, echo_reason)
                     with stats_lock:
                         stats['echo_server_blocked'] += 1
-                    tprint(f"[PATHS FP] Echo-server bloqué: {url} — {echo_reason}")
-                    return (403, None, response_time, f"False positive: {echo_reason}")
+                    return (403, None, response_time, f"FP: {echo_reason}")
                 is_coherent, coherence_reason = check_content_coherence(content, parsed_path)
                 if not is_coherent:
-                    return (403, None, response_time, f"Content mismatch: {coherence_reason}")
+                    return (403, None, response_time, f"Mismatch: {coherence_reason}")
                 return (200, content, response_time, None)
             elif response.status_code == 403:
                 return (403, None, response_time, None)
@@ -1240,7 +1148,7 @@ class PathMonitor:
             "color":       0x00ff00,
             "fields": [
                 {"name": "Taille", "value": f"{len(content)} bytes", "inline": True},
-                {"name": "Status", "value": "200 OK",                "inline": True},
+                {"name": "Status", "value": "200 OK", "inline": True},
             ],
             "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
@@ -1248,13 +1156,13 @@ class PathMonitor:
         discord_send({"embeds": [embed]})
         tprint(f"[PATHS ALERT] Fichier sensible: {url}")
 
-    def check_domain_paths(self, domain) -> tuple:
-        host, port = parse_subdomain_entry(domain)
+    def check_domain_paths(self, domain):
+        host, port  = parse_subdomain_entry(domain)
         found = errors = checked = 0
         for path in self.paths:
             for protocol in ['https', 'http']:
-                url                                          = f"{protocol}://{host}{path}"
-                status_code, content, response_time, error  = self.check_path(url)
+                url                                         = f"{protocol}://{host}{path}"
+                status_code, content, response_time, error = self.check_path(url)
                 checked += 1
                 if status_code == 200 and content:
                     tprint(f"[PATHS] ✅ TROUVE: {url} [{len(content)} bytes]")
@@ -1269,15 +1177,11 @@ class PathMonitor:
         return found, checked, errors
 
     def check_all(self):
-        total_found = total_checked = total_errors = 0
-        domain_count = 0
+        total_found = total_checked = total_errors = domain_count = 0
         start        = time.time()
-        MAX_WORKERS  = 50
         SUBMIT_BATCH = 200
-
         tprint(f"[PATHS CRON] Debut scan ({len(self.paths)} paths/domaine)...")
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="PathCheck") as executor:
+        with ThreadPoolExecutor(max_workers=50, thread_name_prefix="PathCheck") as executor:
             futures = {}
 
             def _flush_done():
@@ -1290,14 +1194,13 @@ class PathMonitor:
                         total_checked += checked
                         total_errors  += errors
                     except Exception as e:
-                        tprint(f"[PATHS ERROR] {futures[f]}: {str(e)[:80]}")
+                        tprint(f"[PATHS ERROR] {str(e)[:80]}")
                     del futures[f]
 
             for domain in db.iter_all_domains(page_size=SUBMIT_BATCH):
                 domain_count += 1
                 future         = executor.submit(self.check_domain_paths, domain)
                 futures[future] = domain
-
                 if len(futures) >= SUBMIT_BATCH:
                     _flush_done()
 
@@ -1308,15 +1211,11 @@ class PathMonitor:
                     total_checked += checked
                     total_errors  += errors
                 except Exception as e:
-                    tprint(f"[PATHS ERROR] {futures[future]}: {str(e)[:80]}")
+                    tprint(f"[PATHS ERROR] {str(e)[:80]}")
 
         elapsed = int(time.time() - start)
         tprint(f"[PATHS CRON] Scan terminé — {domain_count} domaines en {elapsed}s")
         tprint(f"[PATHS CRON] Requetes: {total_checked} | erreurs: {total_errors}")
-        with stats_lock:
-            echo_blocked = stats['echo_server_blocked']
-        if echo_blocked > 0:
-            tprint(f"[PATHS CRON] 🛡️ {echo_blocked} echo-server(s) bloqué(s)")
         if total_found > 0:
             tprint(f"[PATHS CRON] ⚠️ {total_found} fichier(s) sensible(s) trouvé(s) !")
         else:
@@ -1375,7 +1274,6 @@ JS_SECRET_ALLOWLIST_VALUES = {
     'passwords must be at least', 'password must be', 'at least 8 characters',
     'confirm your password', 'enter your password', 'validation error',
     'must match', 'required field', 'invalid format', 'invalid input',
-    'ql-password', '#password', 'password_field', 'expandwildcard',
     'generaldemo', 'summer2023', 'demo2024', 'test123', 'admin123',
     'qwerty', 'password123', 'letmein', 'welcome', 'admin',
     '0000000000000000', '1111111111111111',
@@ -1389,15 +1287,13 @@ JS_SECRET_COMPILED = {
     name: re.compile(pattern, re.MULTILINE | re.DOTALL)
     for name, pattern in JS_SECRET_PATTERNS_RAW.items()
 }
-
-tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns compilés (v4.4.2)")
+tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns compilés (v4.4.3)")
 
 # ==================== JS SECRET SCANNER ====================
 class JSScanner:
     SECRET_VALIDATORS = {
         'AWS Access Key ID':      lambda v: len(v) == 20 and v.isupper(),
         'AWS Secret Access Key':  lambda v: 30 <= len(v) <= 40,
-        'AWS Session Token':      lambda v: 100 <= len(v) <= 300,
         'GCP API Key':            lambda v: len(v) == 39 and v.startswith('AIza'),
         'GitHub Personal Token':  lambda v: len(v) == 36 and v.isalnum(),
         'GitHub OAuth Token':     lambda v: len(v) == 36 and v.isalnum(),
@@ -1413,13 +1309,13 @@ class JSScanner:
         'OpenSSH Private Key':    lambda v: 'BEGIN OPENSSH PRIVATE KEY' in v,
         'Slack Bot Token':        lambda v: v.startswith('xoxb-') and len(v) > 40,
         'Discord Bot Token':      lambda v: (v.startswith('M') or v.startswith('N')) and '.' in v,
-        'Telegram Bot Token':     lambda v: re.match(r'^\d{8,10}:AA[A-Za-z0-9_-]{33}$', v),
+        'Telegram Bot Token':     lambda v: bool(re.match(r'^\d{8,10}:AA[A-Za-z0-9_-]{33}$', v)),
         'Heroku API Key':         lambda v: bool(re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', v)),
         'DigitalOcean Token':     lambda v: v.startswith('dop_v1_') and len(v) > 40,
         'CircleCI Token':         lambda v: len(v) == 40 and all(c in '0123456789abcdef' for c in v.lower()),
     }
 
-    def _validate_secret_format(self, secret_type: str, value: str) -> bool:
+    def _validate_secret_format(self, secret_type, value):
         if secret_type not in self.SECRET_VALIDATORS:
             return True
         try:
@@ -1427,35 +1323,29 @@ class JSScanner:
         except Exception:
             return False
 
-    def _content_hash(self, content: str) -> str:
-        return hashlib.sha256(content.encode('utf-8', errors='replace')).hexdigest()[:16]
-
     _BASE64_BINARY_PREFIXES = (
-        'ivborw0kggo', 'jvber', 'phN2zy', 'phn2zy', 'aaec', 'ugaa',
-        'otar', 'amos', 'agmif', 'r0lgodlh', 't2gg', 'ue1a', 'pgg=',
+        'ivborw0kggo', 'jvber', 'phn2zy', 'aaec', 'ugaa', 'otar',
+        'amos', 'agmif', 'r0lgodlh', 't2gg', 'ue1a',
     )
 
-    def _is_base64_binary(self, value: str) -> bool:
+    def _is_base64_binary(self, value):
         v_low = value.lower()
         if any(v_low.startswith(p) for p in self._BASE64_BINARY_PREFIXES):
             return True
         b64_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=')
         if len(value) > 80 and all(c in b64_chars for c in value):
             try:
-                padded = value[:64] + '=' * (4 - len(value[:64]) % 4)
+                padded  = value[:64] + '=' * (4 - len(value[:64]) % 4)
                 decoded = base64.b64decode(padded, validate=False)[:6]
-                magic = [
-                    b'\x89PNG', b'GIF8', b'%PDF', b'\x00asm',
-                    b'PK\x03\x04', b'\x00\x01\x00\x00', b'OTTO',
-                    b'<svg', b'<?xm', b'<htm',
-                ]
+                magic   = [b'\x89PNG', b'GIF8', b'%PDF', b'\x00asm',
+                           b'PK\x03\x04', b'\x00\x01\x00\x00', b'OTTO', b'<svg', b'<?xm', b'<htm']
                 if any(decoded.startswith(m) for m in magic):
                     return True
             except Exception:
                 pass
         return False
 
-    def _is_allowlisted_value(self, value: str, secret_type: str = None) -> bool:
+    def _is_allowlisted_value(self, value, secret_type=None):
         v = value.strip().lower()
         MIN_LENGTHS = {
             'AWS Access Key ID': 20, 'AWS Secret Access Key': 30,
@@ -1463,8 +1353,7 @@ class JSScanner:
             'JWT Token': 30, 'CircleCI Token': 32, 'Heroku API Key': 36,
             'Slack Bot Token': 40, 'Discord Bot Token': 30,
         }
-        min_len = MIN_LENGTHS.get(secret_type, 16)
-        if len(v) < min_len:
+        if len(v) < MIN_LENGTHS.get(secret_type, 16):
             return True
         if v in JS_SECRET_ALLOWLIST_VALUES:
             return True
@@ -1488,19 +1377,18 @@ class JSScanner:
         if len(value) > 50:
             if len(set(value)) < 12:
                 return True
-            digit_ratio = sum(1 for c in value if c.isdigit()) / len(value)
-            if digit_ratio > 0.85 and len(value) > 50:
+            if sum(1 for c in value if c.isdigit()) / len(value) > 0.85:
                 return True
         return False
 
-    def _extract_context(self, content: str, match) -> str:
+    def _extract_context(self, content, match):
         line_start = content.rfind('\n', 0, match.start())
         line_start = 0 if line_start == -1 else line_start + 1
         line_end   = content.find('\n', match.end())
         line_end   = len(content) if line_end == -1 else line_end
         return content[line_start:line_end][:500]
 
-    def _calculate_confidence(self, secret_type: str, value: str, context: str) -> int:
+    def _calculate_confidence(self, secret_type, value, context):
         base_scores = {
             'AWS Access Key ID': 95, 'AWS Secret Access Key': 95,
             'GCP API Key': 95, 'GCP Service Account Key': 95,
@@ -1536,13 +1424,12 @@ class JSScanner:
             confidence -= 30
         return max(0, min(100, confidence))
 
-    def extract_js_urls(self, html: str, base_url: str) -> list:
+    def extract_js_urls(self, html, base_url):
         parsed_base = urlparse(base_url)
         base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
         found_urls  = set()
         for m in re.finditer(
-            r'<script[^>]+src\s*=\s*["\']([^"\']+\.js(?:\?[^"\']*)?)["\']',
-            html, re.IGNORECASE
+            r'<script[^>]+src\s*=\s*["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', html, re.IGNORECASE
         ):
             src = m.group(1).strip()
             if src.startswith('http://') or src.startswith('https://'):
@@ -1561,10 +1448,9 @@ class JSScanner:
             found_urls.add(url.split('?')[0])
         return list(found_urls)[:MAX_JS_PER_DOMAIN]
 
-    def scan_js_content(self, content: str, js_url: str, domain: str = "") -> list:
+    def scan_js_content(self, content, js_url, domain=""):
         findings  = []
         seen_vals = set()
-
         for secret_type, pattern in JS_SECRET_COMPILED.items():
             try:
                 for match in pattern.finditer(content):
@@ -1582,7 +1468,7 @@ class JSScanner:
                     confidence = self._calculate_confidence(secret_type, value, context)
                     if confidence < 75:
                         if domain:
-                            db.log_js_false_positive(domain, js_url, secret_type, value[:120], f"Confiance basse: {confidence}%")
+                            db.log_js_false_positive(domain, js_url, secret_type, value[:120], f"Confiance: {confidence}%")
                         continue
                     findings.append({
                         'type': secret_type, 'value': value[:120],
@@ -1590,10 +1476,9 @@ class JSScanner:
                     })
             except Exception:
                 continue
-
         return findings
 
-    def _download_js_to_tmp(self, js_url: str) -> tuple:
+    def _download_js_to_tmp(self, js_url):
         session  = get_session()
         tmp_path = None
         try:
@@ -1622,18 +1507,17 @@ class JSScanner:
                     pass
             return (None, None, 0)
 
-    def _delete_tmp(self, tmp_path: str):
+    def _delete_tmp(self, tmp_path):
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except Exception as e:
-                tprint(f"[JS SCAN] Erreur suppression {tmp_path}: {e}")
+            except Exception:
+                pass
 
-    def scan_domain(self, domain: str) -> list:
+    def scan_domain(self, domain):
         all_findings = []
         session      = get_session()
         html = final_url = None
-
         for protocol in ['https', 'http']:
             try:
                 with _http_semaphore:
@@ -1644,21 +1528,17 @@ class JSScanner:
                     break
             except Exception:
                 continue
-
         if not html:
             return all_findings
-
         js_urls = self.extract_js_urls(html, final_url)
         if not js_urls:
             return all_findings
-
         for js_url in js_urls:
             tmp_path = None
             try:
-                tmp_path, content_hash, size_bytes = self._download_js_to_tmp(js_url)
+                tmp_path, content_hash, _ = self._download_js_to_tmp(js_url)
                 if not tmp_path:
                     continue
-
                 history = db.get_js_scan_history(js_url)
                 if history and history['content_hash'] == content_hash:
                     self._delete_tmp(tmp_path)
@@ -1666,44 +1546,38 @@ class JSScanner:
                     with stats_lock:
                         stats['js_files_scanned'] += 1
                     continue
-
                 with open(tmp_path, 'r', encoding='utf-8', errors='replace') as f:
                     js_content = f.read()
-
                 findings = self.scan_js_content(js_content, js_url, domain)
                 db.update_js_scan_history(js_url, content_hash, len(findings))
-
                 with stats_lock:
                     stats['js_files_scanned'] += 1
-
                 if findings:
                     new_findings = []
-                    for f in findings:
-                        is_new = db.save_js_secret(domain, js_url, f['type'], f['value'], f['context'], f['confidence'])
+                    for fi in findings:
+                        is_new = db.save_js_secret(domain, js_url, fi['type'], fi['value'], fi['context'], fi['confidence'])
                         if is_new:
-                            new_findings.append(f)
+                            new_findings.append(fi)
                     if new_findings:
-                        tprint(f"[JS SCAN] ⚠️ {len(new_findings)} SECRET(S) VRAI(S) trouvé(s) !")
+                        tprint(f"[JS SCAN] ⚠️ {len(new_findings)} SECRET(S) trouvé(s) dans {domain}!")
                         all_findings.extend(new_findings)
                         with stats_lock:
                             stats['js_secrets_found'] += len(new_findings)
-
             except Exception as e:
                 tprint(f"[JS SCAN] Erreur scan {js_url}: {str(e)[:80]}")
             finally:
                 self._delete_tmp(tmp_path)
                 tmp_path = None
-
         return all_findings
 
-    def send_js_alert(self, domain: str, findings: list):
+    def send_js_alert(self, domain, findings):
         if not findings:
             return
-        by_url = {}
+        by_url         = {}
+        critical_count = 0
         for f in findings:
             by_url.setdefault(f['url'], []).append(f)
-        fields         = []
-        critical_count = 0
+        fields = []
         for js_url, js_findings in list(by_url.items())[:10]:
             lines = []
             for f in js_findings[:6]:
@@ -1713,44 +1587,31 @@ class JSScanner:
                     icon = "🔴"; critical_count += 1
                 elif conf >= 85:
                     icon = "🟠"
-                elif conf >= 75:
-                    icon = "🟡"
                 else:
-                    icon = "⚪"
+                    icon = "🟡"
                 lines.append(f"{icon} **{f['type']}** ({conf}%)\n  `{val_preview}`")
-            fields.append({
-                "name":   f"📄 {js_url.split('/')[-1][:60]}",
-                "value":  '\n'.join(lines)[:1024],
-                "inline": False
-            })
+            fields.append({"name": f"📄 {js_url.split('/')[-1][:60]}", "value": '\n'.join(lines)[:1024], "inline": False})
         total_secrets = len(findings)
-        color = 0xff0000 if critical_count > 0 else (0xff9900 if total_secrets > 0 else 0xffff00)
-        emoji = "🚨" if critical_count > 0 else ("⚠️" if total_secrets > 0 else "ℹ️")
+        color         = 0xff0000 if critical_count > 0 else 0xff9900
+        emoji         = "🚨" if critical_count > 0 else "⚠️"
         embed = {
-            "title":       f"{emoji} 🔑 SECRETS JS DETECTÉS — {domain}",
-            "description": f"**{total_secrets}** secret(s) VRAI(S) | **{critical_count}** CRITIQUE(S)",
+            "title":       f"{emoji} 🔑 SECRETS JS — {domain}",
+            "description": f"**{total_secrets}** secret(s) | **{critical_count}** CRITIQUE(S)",
             "color":       color, "fields": fields,
-            "footer":      {"text": "CT Monitor v4.4.2"},
+            "footer":      {"text": "CT Monitor v4.4.3"},
             "timestamp":   datetime.utcnow().isoformat()
         }
         discord_send({"embeds": [embed]})
-        tprint(f"[JS ALERT] {emoji} {domain} — {total_secrets} SECRET(S) ({critical_count} critique(s)) → Discord")
+        tprint(f"[JS ALERT] {emoji} {domain} — {total_secrets} SECRET(S) → Discord")
 
     def scan_all_parallel(self):
-        tprint("[JS SCAN] ════════════════════════════════════════")
-        tprint(f"[JS SCAN] Démarrage scan secrets JS PARALLÈLE ({JS_SCAN_WORKERS} workers, v4.4.2)")
-
-        start         = time.time()
-        total_domains = 0
-        futures_map   = {}
-
+        tprint(f"[JS SCAN] ════ Démarrage scan JS PARALLÈLE ({JS_SCAN_WORKERS} workers) ════")
+        start       = time.time()
+        futures_map = {}
         for domain in db.iter_online_domains(page_size=100):
-            total_domains += 1
             future              = JS_WORKER_POOL.submit(self.scan_domain, domain)
             futures_map[future] = domain
-
-        tprint(f"[JS SCAN] {total_domains} domaines soumis au pool ({JS_SCAN_WORKERS} workers)")
-
+        tprint(f"[JS SCAN] {len(futures_map)} domaines soumis")
         alerts_sent = 0
         for future in as_completed(futures_map):
             domain = futures_map[future]
@@ -1763,86 +1624,103 @@ class JSScanner:
                     alerts_sent += 1
             except Exception as e:
                 tprint(f"[JS SCAN] Erreur domaine {domain}: {str(e)[:80]}")
-
         elapsed = int(time.time() - start)
         with stats_lock:
-            total_files   = stats['js_files_scanned']
             total_secrets = stats['js_secrets_found']
-        tprint(f"[JS SCAN] ════════════════════════════════════════")
-        tprint(f"[JS SCAN] Terminé — {total_domains} domaine(s) | {total_files} JS | {elapsed}s")
-        tprint(f"[JS SCAN] Alertes envoyées: {alerts_sent}")
+        tprint(f"[JS SCAN] ════ Terminé — {len(futures_map)} domaines | {elapsed}s | alertes: {alerts_sent} ════")
         if total_secrets > 0:
-            tprint(f"[JS SCAN] 🚨 {total_secrets} SECRET(S) RÉEL(S) trouvé(s) au total !")
+            tprint(f"[JS SCAN] 🚨 {total_secrets} SECRET(S) RÉEL(S) au total !")
         else:
-            tprint("[JS SCAN] ✅ Aucun secret valide trouvé (zéro faux positifs)")
-
+            tprint("[JS SCAN] ✅ Aucun secret valide (zéro faux positifs)")
         with stats_lock:
             stats['last_js_scan'] = datetime.utcnow()
-
-    def scan_all_sequential(self):
-        self.scan_all_parallel()
 
 js_scanner = JSScanner()
 
 # ==================== LOAD MANUAL SUBDOMAINS ====================
 def load_subdomains_from_file():
     """
-    ✅ FIX v4.4.2: Charge depuis DATA_DIR/subdomains.txt (volume persistant).
-    Fallback automatique vers /app/subdomains.txt si absent dans data/.
+    ✅ v4.4.3: Lecture robuste anti-CRLF, anti-BOM, anti-encoding.
+    Cherche dans: /app/subdomains.txt → /app/data/subdomains.txt
     """
-    loaded = duplicates = 0
+    loaded = duplicates = skipped = 0
 
-    # ✅ Fallback: si le fichier n'existe pas dans data/, cherche dans /app/
-    target_file = SUBDOMAINS_FILE
-    if not os.path.exists(target_file):
-        fallback = '/app/subdomains.txt'
-        if os.path.exists(fallback):
-            tprint(f"[LOAD] Fallback: utilisation de {fallback}")
-            target_file = fallback
-        else:
-            tprint(f"[INFO] {target_file} n'existe pas (optionnel)")
-            tprint(f"[INFO] Pour ajouter des sous-domaines: echo 'sub.domain.com' >> {SUBDOMAINS_FILE}")
-            return loaded, duplicates
+    # Trouver le fichier
+    candidates = ['/app/subdomains.txt', f'{DATA_DIR}/subdomains.txt']
+    target_file = None
+    for path in candidates:
+        if os.path.exists(path):
+            target_file = path
+            break
+
+    if not target_file:
+        tprint(f"[LOAD] Aucun subdomains.txt trouvé dans {candidates}")
+        tprint(f"[LOAD] Créez /app/subdomains.txt avec vos sous-domaines (un par ligne)")
+        return 0, 0
 
     try:
-        with open(target_file, 'r') as f:
-            lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+        # ✅ Lecture robuste: utf-8-sig gère le BOM Windows, strip() gère CRLF
+        with open(target_file, 'r', encoding='utf-8-sig', errors='replace') as f:
+            raw_lines = f.readlines()
+
+        tprint(f"[LOAD] Lecture de {target_file} — {len(raw_lines)} ligne(s) brutes")
+
+        lines = []
+        for i, line in enumerate(raw_lines):
+            # Strip tous les caractères invisibles: \r \n \t espace BOM etc.
+            clean = line.strip('\r\n\t \ufeff\x00').strip()
+            if clean and not clean.startswith('#'):
+                lines.append(clean)
+            elif clean.startswith('#'):
+                pass  # commentaire
+            # ligne vide ignorée silencieusement
+
+        tprint(f"[LOAD] {len(lines)} sous-domaine(s) valides après nettoyage")
 
         if not lines:
-            tprint(f"[LOAD] {target_file} est vide — aucun sous-domaine à charger")
-            return loaded, duplicates
-
-        tprint(f"[LOAD] {len(lines)} sous-domaines dans {target_file}")
+            tprint(f"[LOAD] ⚠️ Fichier vide ou que des commentaires")
+            # Debug: affiche les premières lignes brutes
+            for i, line in enumerate(raw_lines[:5]):
+                tprint(f"[LOAD DEBUG] ligne {i+1}: {repr(line)}")
+            return 0, 0
 
         for entry in lines:
             subdomain, port = parse_subdomain_entry(entry)
+
             if not validate_domain(subdomain):
-                tprint(f"[LOAD] ❌ {subdomain} — format invalide")
+                tprint(f"[LOAD] ❌ '{subdomain}' — format invalide (repr: {repr(subdomain)[:50]})")
+                skipped += 1
                 continue
+
             if db.subdomain_exists(subdomain):
                 duplicates += 1
                 continue
-            tprint(f"[LOAD] 🔍 Check initial: {subdomain} ...")
-            check_result  = check_domain(subdomain)
-            status_code   = None
-            response_time = None
+
+            tprint(f"[LOAD] 🔍 Check: {subdomain} ...")
+            check_result = check_domain(subdomain)
+            status_code  = None
+
             if check_result is None:
-                tprint(f"[LOAD] ⚠️ Échec total après retries pour {subdomain}")
+                tprint(f"[LOAD] ⚠️ Timeout/erreur pour {subdomain}")
             else:
-                status_code, response_time = check_result
+                status_code, _ = check_result
+
             if port:
                 port_open, _ = check_port(subdomain, port)
                 tprint(f"[LOAD] 🔌 {subdomain}:{port} — port {'ouvert' if port_open else 'fermé'}")
+
             base_domain = next((t for t in targets if subdomain == t or subdomain.endswith('.' + t)), subdomain)
             db.add_subdomain_from_file(subdomain, base_domain, status_code)
             loaded += 1
+
             status_str = str(status_code) if status_code else "timeout"
             tprint(f"[LOAD] {'✅' if status_code == 200 else '🔴'} {subdomain} [{status_str}]")
 
-        tprint(f"[LOAD] Résumé: {loaded} ajouté(s), {duplicates} déjà en DB")
+        tprint(f"[LOAD] ══ Résumé: {loaded} ajouté(s) | {duplicates} déjà en DB | {skipped} invalide(s) ══")
         return loaded, duplicates
+
     except Exception as e:
-        tprint(f"[ERROR] Chargement subdomains: {e}")
+        tprint(f"[LOAD ERROR] {e}")
         traceback.print_exc()
         return 0, 0
 
@@ -1872,8 +1750,8 @@ def send_discovery_alert(matched_domains_with_status, log_name):
                     by_base[base]['accessible'].append((domain, status_code))
                 else:
                     by_base[base]['unreachable'].append((domain, status_code))
-        description       = ""
-        total_accessible  = total_unreachable = 0
+        description      = ""
+        total_accessible = total_unreachable = 0
         for base, data in sorted(by_base.items()):
             description += f"\n**{base}**\n"
             if data['accessible']:
@@ -1895,7 +1773,7 @@ def send_discovery_alert(matched_domains_with_status, log_name):
                 {"name": "Hors ligne", "value": str(total_unreachable), "inline": True},
                 {"name": "Source",     "value": log_name,               "inline": True},
             ],
-            "footer":    {"text": "CT Monitor"},
+            "footer":    {"text": "CT Monitor v4.4.3"},
             "timestamp": datetime.utcnow().isoformat()
         }
         discord_send({"embeds": [embed]})
@@ -1904,21 +1782,21 @@ def send_discovery_alert(matched_domains_with_status, log_name):
             stats['dernière_alerte']  = datetime.utcnow()
         tprint(f"[DISCORD] {len(filtered)} notifiés (✅{total_accessible} ❌{total_unreachable})")
     except Exception as e:
-        tprint(f"[DISCORD ERROR] send_discovery_alert: {e}")
+        tprint(f"[DISCORD ERROR] {e}")
 
 def send_now_accessible_alert(domain):
     embed = {
         "title":       f"🟢 {domain}",
         "description": "Ce domaine est maintenant accessible (200 OK)",
         "color":       0x00ff00,
-        "footer":      {"text": "CT Monitor"},
+        "footer":      {"text": "CT Monitor v4.4.3"},
         "timestamp":   datetime.utcnow().isoformat()
     }
     discord_send({"embeds": [embed]})
-    tprint(f"[ALERT] {domain} est maintenant accessible!")
+    tprint(f"[ALERT] 🟢 {domain} est maintenant accessible!")
 
 # ==================== PARSING CERTIFICATS ====================
-def _cert_hash(leaf_input: str) -> str:
+def _cert_hash(leaf_input):
     return hashlib.sha1(leaf_input.encode()).hexdigest()[:16]
 
 def parse_certificate(entry):
@@ -1990,31 +1868,27 @@ def parse_certificate(entry):
 _path_scan_running = threading.Event()
 _js_scan_running   = threading.Event()
 
-def _recheck_single_domain(domain_row: tuple) -> tuple:
+def _recheck_single_domain(domain_row):
     domain, base_domain, last_check = domain_row
-    host, port = parse_subdomain_entry(domain)
+    host, port   = parse_subdomain_entry(domain)
     check_result = check_domain(host)
-    status_code = response_time = None
-    if check_result is None:
-        tprint(f"[CRON] ⚠️ Échec total check {domain}")
-    else:
+    status_code  = response_time = None
+    if check_result is not None:
         status_code, response_time = check_result
-
     port_status = ""
     if port:
         port_open, _ = check_port(host, port)
         port_status   = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
         if port_open and (status_code is None or status_code >= 400):
             status_code = 200
-
     back_online = status_code == 200
     return (domain, status_code, response_time, back_online, port_status)
 
 def cron_recheck_unreachable():
-    tprint("[CRON] Thread recheck + JS scan démarré (PARALLEL v4.4.2)")
-    RECHECK_BATCH      = 200
-    RECHECK_WORKERS    = 30
-    last_js_scan_time  = 0
+    tprint("[CRON] Thread recheck + JS scan démarré (v4.4.3)")
+    RECHECK_BATCH     = 200
+    RECHECK_WORKERS   = 30
+    last_js_scan_time = 0
 
     while True:
         try:
@@ -2029,7 +1903,6 @@ def cron_recheck_unreachable():
                     domain_rows = db.get_offline(limit=RECHECK_BATCH, offset=offset)
                     if not domain_rows:
                         break
-
                     with ThreadPoolExecutor(max_workers=RECHECK_WORKERS, thread_name_prefix="Recheck") as ex:
                         futures = {ex.submit(_recheck_single_domain, row): row for row in domain_rows}
                         for future in as_completed(futures):
@@ -2042,7 +1915,6 @@ def cron_recheck_unreachable():
                                     back_online += 1
                                 else:
                                     db.update_check(domain, status_code, response_time)
-                                    tprint(f"[CRON] 🔴 {domain} [{status_code or 'timeout'}]{port_status}")
                                     still_down += 1
                             except Exception as e:
                                 tprint(f"[CRON] Erreur recheck: {str(e)[:80]}")
@@ -2051,7 +1923,6 @@ def cron_recheck_unreachable():
                 tprint("[CRON] Aucun domaine offline à recheck")
 
             tprint(f"[CRON] {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
-
             db.purge_history(retention_days=CHECK_HISTORY_RETENTION_DAYS)
 
             with stats_lock:
@@ -2062,7 +1933,7 @@ def cron_recheck_unreachable():
                     stats['last_vacuum'] = datetime.utcnow()
 
             if _path_scan_running.is_set():
-                tprint("[CRON] Scan paths ignoré — scan précédent encore en cours")
+                tprint("[CRON] Scan paths ignoré — encore en cours")
             else:
                 def _run_path_scan():
                     _path_scan_running.set()
@@ -2075,7 +1946,7 @@ def cron_recheck_unreachable():
 
             now = time.time()
             if _js_scan_running.is_set():
-                tprint("[CRON] Scan JS ignoré — scan précédent encore en cours")
+                tprint("[CRON] Scan JS ignoré — encore en cours")
             elif now - last_js_scan_time >= JS_SCAN_INTERVAL:
                 last_js_scan_time = now
                 def _run_js_scan():
@@ -2085,7 +1956,7 @@ def cron_recheck_unreachable():
                     finally:
                         _js_scan_running.clear()
                 threading.Thread(target=_run_js_scan, daemon=True, name="JSScan").start()
-                tprint(f"[CRON] Scan JS parallèle lancé (workers: {JS_SCAN_WORKERS})")
+                tprint(f"[CRON] Scan JS lancé ({JS_SCAN_WORKERS} workers)")
             else:
                 next_scan = int(JS_SCAN_INTERVAL - (now - last_js_scan_time))
                 tprint(f"[CRON] Prochain scan JS dans {next_scan}s")
@@ -2106,25 +1977,20 @@ def monitor_log(log_config):
     cb       = get_circuit_breaker(log_name)
 
     if not cb.is_available():
-        tprint(f"[{log_name}] ⚠️ Circuit breaker OPEN — skipped")
         with stats_lock:
             stats['circuit_breaker_trips'] += 1
         return 0
 
-    # ✅ FIX v4.4.2: Lookback augmenté selon priorité (au lieu de 1000 fixe)
+    # ✅ FIX: Lookback augmenté selon priorité
     if log_name not in stats['positions']:
         try:
             response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
             tree_size = response.json()['tree_size']
+            lookback  = {'CRITICAL': 500000, 'HIGH': 200000, 'MEDIUM': 50000}.get(priority, 10000)
             with stats_lock:
-                lookback = {
-                    'CRITICAL': 500000,
-                    'HIGH':     200000,
-                    'MEDIUM':   50000,
-                }.get(priority, 10000)
                 stats['positions'][log_name] = max(0, tree_size - lookback)
             cb.record_success()
-            tprint(f"[INIT] {log_name}: position initiale {stats['positions'][log_name]:,} (lookback={lookback:,})")
+            tprint(f"[INIT] {log_name}: pos={stats['positions'][log_name]:,} (lookback={lookback:,})")
         except Exception as e:
             cb.record_failure()
             tprint(f"[{log_name}] Erreur init: {str(e)[:80]}")
@@ -2148,8 +2014,8 @@ def monitor_log(log_config):
     max_batches = {'CRITICAL': MAX_BATCHES_CRITICAL, 'HIGH': MAX_BATCHES_HIGH}.get(priority, MAX_BATCHES_MEDIUM)
     tprint(f"[{log_name}] Backlog: {backlog:,} — max {max_batches * BATCH_SIZE:,} certs ce cycle")
 
-    batches_done  = 0
-    all_results   = []
+    batches_done = 0
+    all_results  = []
     pending_http: dict[Future, str] = {}
 
     while batches_done < max_batches:
@@ -2162,8 +2028,7 @@ def monitor_log(log_config):
             response = requests.get(
                 f"{log_url}/ct/v1/get-entries",
                 params={"start": current_pos, "end": end_pos - 1},
-                timeout=30
-            )
+                timeout=30)
             entries = response.json().get('entries', [])
         except Exception:
             break
@@ -2189,10 +2054,10 @@ def monitor_log(log_config):
                 if cycle_seen(domain, log_name):
                     continue
                 if len(pending_http) >= MAX_PENDING_HTTP:
-                    tprint(f"[{log_name}] ⚠️ Max pending futures — flush batch")
+                    tprint(f"[{log_name}] ⚠️ Max pending futures — flush")
                     for future in list(pending_http.keys())[:100]:
                         try:
-                            status_code, response_time = future.result(timeout=2)
+                            status_code, _ = future.result(timeout=2)
                             all_results.append((pending_http[future], status_code))
                         except Exception:
                             pass
@@ -2265,21 +2130,17 @@ def cleanup_db():
 
 # ==================== DUMP DB ====================
 def dump_db():
-    tprint("[DUMP] Envoi du contenu de la DB sur Discord...")
-    PAGE_SIZE = 100
+    tprint("[DUMP] Envoi DB sur Discord...")
     try:
-        conn   = db.get_conn()
-        cursor = conn.cursor()
+        conn    = db.get_conn()
+        cursor  = conn.cursor()
         summary = db.stats_summary()
         requests.post(DISCORD_WEBHOOK, json={"embeds": [{
             "title":       "Base de données — Dump complet",
-            "description": (
-                f"**Total:** {summary['total']} domaine(s)\n"
-                f"**Taille:** {db.size_mb()} MB\n"
-                f"**Timeout:** {summary['timeout']} | **4xx:** {summary['4xx']} | **5xx:** {summary['5xx']}"
-            ),
-            "color":     0x5865f2,
-            "footer":    {"text": "CT Monitor — DUMP_DB"},
+            "description": (f"**Total:** {summary['total']} domaine(s)\n"
+                            f"**Taille:** {db.size_mb()} MB\n"
+                            f"**Timeout:** {summary['timeout']} | **4xx:** {summary['4xx']} | **5xx:** {summary['5xx']}"),
+            "color": 0x5865f2, "footer": {"text": "CT Monitor — DUMP_DB"},
             "timestamp": datetime.utcnow().isoformat()
         }]}, timeout=10)
         cursor.execute('SELECT domain, status_code, log_source, last_check FROM subdomains ORDER BY last_check DESC')
@@ -2287,7 +2148,7 @@ def dump_db():
         chunk_size = 20
         buffer     = []
         while True:
-            rows = cursor.fetchmany(PAGE_SIZE)
+            rows = cursor.fetchmany(100)
             if not rows:
                 break
             buffer.extend(rows)
@@ -2309,54 +2170,46 @@ def dump_db():
             requests.post(DISCORD_WEBHOOK, json={"embeds": [{
                 "title":       f"Domaines (fin) — {len(buffer)} entrée(s)",
                 "description": "\n".join(lines),
-                "color":       0x2f3136,
-                "footer":      {"text": "CT Monitor — DUMP_DB"}
+                "color": 0x2f3136, "footer": {"text": "CT Monitor — DUMP_DB"}
             }]}, timeout=10)
         requests.post(DISCORD_WEBHOOK, json={"embeds": [{
             "title":       "Dump terminé",
-            "description": f"{total_sent} domaine(s) envoyés. Retire `DUMP_DB=1` pour relancer.",
-            "color":       0x00ff00,
-            "footer":      {"text": "CT Monitor — DUMP_DB"}
+            "description": f"{total_sent} domaine(s) envoyés.",
+            "color": 0x00ff00, "footer": {"text": "CT Monitor — DUMP_DB"}
         }]}, timeout=10)
         tprint(f"[DUMP] {total_sent} domaine(s) envoyés")
     except Exception as e:
         tprint(f"[DUMP ERROR] {e}")
-        if DISCORD_WEBHOOK:
-            requests.post(DISCORD_WEBHOOK, json={"embeds": [{
-                "title": "Dump erreur", "description": str(e), "color": 0xff0000
-            }]}, timeout=10)
 
 if os.environ.get('DUMP_DB', '0') == '1':
     dump_db()
     exit(0)
 
 # ==================== DÉMARRAGE ====================
-tprint("[START] ================================================")
-tprint(f"[START] CT Monitor v4.4.2 - PARALLEL EDITION + SUBDOMAINS FIX")
-tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s) surveillés")
-tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | JS pool: {JS_SCAN_WORKERS} workers")
-tprint(f"[START] DB Writer: queue={DB_WRITE_QUEUE_SIZE} | flush toutes les {int(DB_WRITE_BATCH_TIMEOUT*1000)}ms")
-tprint(f"[START] JS scan interval: {JS_SCAN_INTERVAL}s | Confidence threshold: 75% MINIMUM")
-tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History: {CHECK_HISTORY_RETENTION_DAYS}j")
+tprint("[START] ════════════════════════════════════════════════════")
+tprint(f"[START] CT Monitor v4.4.3")
+tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s): {sorted(targets)}")
+tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} | JS pool: {JS_SCAN_WORKERS}")
+tprint(f"[START] Lookback — CRITICAL: 500k | HIGH: 200k | MEDIUM: 50k")
 tprint(f"[START] SUBDOMAINS_FILE: {SUBDOMAINS_FILE}")
-tprint(f"[START] CT Lookback — CRITICAL: 500k | HIGH: 200k | MEDIUM: 50k")
-tprint("[START] ================================================")
+tprint("[START] ════════════════════════════════════════════════════")
 
+# ✅ Ordre correct: cleanup → subdomains → cron
 tprint("[STARTUP] 1/3 — Nettoyage DB...")
 cleanup_db()
 db.purge_history()
 _s = db.stats_summary()
 tprint(f"[STARTUP] DB: {_s['total']} domaines | online={_s['online']} | {db.size_mb()} MB")
 
-tprint(f"[STARTUP] 2/3 — Chargement {SUBDOMAINS_FILE}...")
+tprint(f"[STARTUP] 2/3 — Chargement subdomains ({SUBDOMAINS_FILE})...")
 loaded_count, dup_count = load_subdomains_from_file()
-tprint(f"[STARTUP] {loaded_count} ajouté(s), {dup_count} déjà en DB")
+tprint(f"[STARTUP] Résultat: {loaded_count} ajouté(s), {dup_count} déjà en DB")
 
 tprint("[STARTUP] 3/3 — Démarrage thread cron...")
 threading.Thread(target=cron_recheck_unreachable, daemon=True, name="CronRecheck").start()
 time.sleep(1)
-tprint("[STARTUP] Thread cron démarré")
-tprint("[STARTUP] ================================================")
+tprint("[STARTUP] Thread cron démarré ✅")
+tprint("[STARTUP] ════════════════════════════════════════════════════")
 
 # ==================== BOUCLE PRINCIPALE ====================
 cycle = 0
@@ -2366,16 +2219,15 @@ while True:
         cycle_start = time.time()
 
         if cycle % TARGETS_RELOAD_INTERVAL == 0:
-            tprint(f"[CYCLE #{cycle}] Reloading targets...")
             new_targets = load_targets()
             if len(new_targets) != len(targets):
-                tprint(f"[CYCLE #{cycle}] Targets changed: {len(targets)} → {len(new_targets)}")
+                tprint(f"[CYCLE #{cycle}] Targets: {len(targets)} → {len(new_targets)}")
                 targets = new_targets
 
         with stats_lock:
             stats['dernière_vérification'] = datetime.utcnow()
 
-        tprint(f"[CYCLE #{cycle}] ---- {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ----")
+        tprint(f"[CYCLE #{cycle}] ════ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ════")
         cycle_reset()
         update_heartbeat()
         monitor_all_logs()
@@ -2388,24 +2240,17 @@ while True:
         cycle_duration = int(time.time() - cycle_start)
         _s = db.stats_summary()
 
-        certs_this_cycle = stats['certificats_analysés']
-        if certs_this_cycle < MIN_CERTS_PER_CYCLE:
-            tprint(f"[ALERT] ⚠️ Seulement {certs_this_cycle} certs ce cycle (min: {MIN_CERTS_PER_CYCLE})")
-
         tprint(f"[CYCLE #{cycle}] Terminé en {cycle_duration}s")
-        tprint(f"[CYCLE #{cycle}] Certificats analysés  : {stats['certificats_analysés']:,}")
-        tprint(f"[CYCLE #{cycle}] Matches trouvés        : {stats['matches_trouvés']:,}")
-        tprint(f"[CYCLE #{cycle}] HTTP checks            : {stats['http_checks']:,}")
-        tprint(f"[CYCLE #{cycle}] Alertes envoyées       : {stats['alertes_envoyées']:,}")
-        tprint(f"[CYCLE #{cycle}] Duplicates évités      : {stats['duplicates_évités']:,}")
-        tprint(f"[CYCLE #{cycle}] Echo-servers bloqués   : {stats['echo_server_blocked']:,}")
-        tprint(f"[CYCLE #{cycle}] JS fichiers scannés    : {stats['js_files_scanned']:,}")
-        tprint(f"[CYCLE #{cycle}] JS SECRETS VRAIS       : {stats['js_secrets_found']:,}")
-        tprint(f"[CYCLE #{cycle}] JS FALSE POSITIVES     : {stats['js_false_positives']:,}")
-        tprint(f"[CYCLE #{cycle}] DB Writer queue        : {stats['db_write_queue_size']} | écrits: {stats['db_writes_processed']:,}")
-        tprint(f"[CYCLE #{cycle}] Discord queue          : {_discord_queue.qsize()} | perdus: {stats['discord_dropped']}")
-        tprint(f"[CYCLE #{cycle}] DB : {_s['total']} domaines | {db.size_mb()} MB")
-        tprint(f"[CYCLE #{cycle}] DB : {_s['timeout']} timeout | {_s['4xx']} 4xx | {_s['5xx']} 5xx")
+        tprint(f"[CYCLE #{cycle}] Certificats analysés : {stats['certificats_analysés']:,}")
+        tprint(f"[CYCLE #{cycle}] Matches trouvés      : {stats['matches_trouvés']:,}")
+        tprint(f"[CYCLE #{cycle}] HTTP checks          : {stats['http_checks']:,}")
+        tprint(f"[CYCLE #{cycle}] Alertes Discord      : {stats['alertes_envoyées']:,}")
+        tprint(f"[CYCLE #{cycle}] Duplicates évités    : {stats['duplicates_évités']:,}")
+        tprint(f"[CYCLE #{cycle}] JS secrets vrais     : {stats['js_secrets_found']:,}")
+        tprint(f"[CYCLE #{cycle}] JS faux positifs     : {stats['js_false_positives']:,}")
+        tprint(f"[CYCLE #{cycle}] DB Writer écrits     : {stats['db_writes_processed']:,}")
+        tprint(f"[CYCLE #{cycle}] Discord perdus       : {stats['discord_dropped']}")
+        tprint(f"[CYCLE #{cycle}] DB: {_s['total']} domaines ({_s['online']} online) | {db.size_mb()} MB")
         tprint(f"[CYCLE #{cycle}] Prochain cycle dans {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 
