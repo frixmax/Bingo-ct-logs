@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION v4.3.2 - PRODUCTION READY (COMPLETE FIXED)
-✅ Regex ultra-strictes (zéro faux positifs garantis)
-✅ Système de confiance 0-100% AMÉLIORÉ
-✅ Emojis visuels (🔴 critique, 🟠 moyen, 🟡 bas)
-✅ Allowlist complète (Unicode, camelCase, validation messages)
-✅ CORRECTIONS JS SCANNER - Validation format, contexte amélioré, confiance intelligente
+CT Monitoring VPS - VERSION v4.4.0 - PARALLEL EDITION
+✅ DatabaseWriter centralisé (queue writes, zéro contention WAL)
+✅ JS Scanner parallélisé (ThreadPoolExecutor dédié)
+✅ Recheck offline parallélisé
+✅ Path scan collecte optimisée
+✅ Reads thread-local conservés (compatibles WAL)
+✅ Tous les locks/semaphores correctement propagés
+✅ Backward compatible avec v4.3.2 (même schéma DB, même config)
 """
 import requests
 import json
@@ -40,7 +42,7 @@ def tprint(msg):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 tprint("=" * 100)
-tprint("CT MONITORING - VERSION v4.3.2 - COMPLETE FIXED (Zero False Positives + Improved JS Scanner)")
+tprint("CT MONITORING - VERSION v4.4.0 - PARALLEL EDITION")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 tprint("=" * 100)
 
@@ -78,51 +80,58 @@ MIN_CERTS_PER_CYCLE          = 100
 HTTP_CONCURRENCY_LIMIT       = 50
 
 # JS Scanner config
-JS_SCAN_TIMEOUT      = 8
-MAX_JS_SIZE          = 3 * 1024 * 1024
-MAX_JS_PER_DOMAIN    = 20
-JS_SCAN_WORKERS      = 5
-JS_SCAN_INTERVAL     = 3600
+JS_SCAN_TIMEOUT   = 8
+MAX_JS_SIZE       = 3 * 1024 * 1024
+MAX_JS_PER_DOMAIN = 20
+JS_SCAN_WORKERS   = 8          # ✅ AUGMENTÉ: parallélisme JS
+JS_SCAN_INTERVAL  = 3600
+
+# DB Writer config
+DB_WRITE_QUEUE_SIZE    = 10000  # ✅ NOUVEAU: queue writes centralisée
+DB_WRITE_BATCH_TIMEOUT = 0.05   # flush toutes les 50ms si inactif
 
 _http_semaphore  = threading.Semaphore(HTTP_CONCURRENCY_LIMIT)
 HTTP_WORKER_POOL = ThreadPoolExecutor(max_workers=HTTP_CONCURRENCY_LIMIT, thread_name_prefix="HTTPWorker")
+# ✅ NOUVEAU: Pool JS dédié, séparé du pool HTTP
+JS_WORKER_POOL   = ThreadPoolExecutor(max_workers=JS_SCAN_WORKERS, thread_name_prefix="JSWorker")
+
 NOTIFICATION_TTL              = 1 * 3600
 CHECK_HISTORY_RETENTION_DAYS  = 7
 VACUUM_INTERVAL_DAYS          = 30
 
 CT_LOGS = [
-    {"name": "Google Argon2026h1",   "url": "https://ct.googleapis.com/logs/us1/argon2026h1",  "enabled": True, "priority": "CRITICAL"},
-    {"name": "Google Argon2026h2",   "url": "https://ct.googleapis.com/logs/us1/argon2026h2",  "enabled": True, "priority": "CRITICAL"},
-    {"name": "Google Argon2027h1",   "url": "https://ct.googleapis.com/logs/us1/argon2027h1",  "enabled": True, "priority": "HIGH"},
-    {"name": "Google Xenon2026h1",   "url": "https://ct.googleapis.com/logs/eu1/xenon2026h1",  "enabled": True, "priority": "CRITICAL"},
-    {"name": "Google Xenon2026h2",   "url": "https://ct.googleapis.com/logs/eu1/xenon2026h2",  "enabled": True, "priority": "CRITICAL"},
-    {"name": "Google Xenon2027h1",   "url": "https://ct.googleapis.com/logs/eu1/xenon2027h1",  "enabled": True, "priority": "HIGH"},
-    {"name": "Google Solera2026h1",  "url": "https://ct.googleapis.com/logs/eu1/solera2026h1", "enabled": True, "priority": "MEDIUM"},
-    {"name": "Cloudflare Nimbus2026","url": "https://ct.cloudflare.com/logs/nimbus2026",        "enabled": True, "priority": "CRITICAL"},
-    {"name": "Cloudflare Nimbus2027","url": "https://ct.cloudflare.com/logs/nimbus2027",        "enabled": True, "priority": "HIGH"},
-    {"name": "DigiCert Wyvern2026h1","url": "https://wyvern.ct.digicert.com/2026h1",           "enabled": True, "priority": "HIGH"},
-    {"name": "DigiCert Wyvern2027h1","url": "https://wyvern.ct.digicert.com/2027h1",           "enabled": True, "priority": "HIGH"},
-    {"name": "DigiCert Wyvern2027h2","url": "https://wyvern.ct.digicert.com/2027h2",           "enabled": True, "priority": "MEDIUM"},
-    {"name": "DigiCert Sphinx2026h1","url": "https://sphinx.ct.digicert.com/2026h1",           "enabled": True, "priority": "HIGH"},
-    {"name": "DigiCert Sphinx2027h1","url": "https://sphinx.ct.digicert.com/2027h1",           "enabled": True, "priority": "HIGH"},
-    {"name": "DigiCert Sphinx2027h2","url": "https://sphinx.ct.digicert.com/2027h2",           "enabled": True, "priority": "MEDIUM"},
-    {"name": "Sectigo Sabre2026h1",  "url": "https://sabre2026h1.ct.sectigo.com",              "enabled": True, "priority": "HIGH"},
-    {"name": "Sectigo Sabre2026h2",  "url": "https://sabre2026h2.ct.sectigo.com",              "enabled": True, "priority": "MEDIUM"},
-    {"name": "Sectigo Mammoth2026h1","url": "https://mammoth2026h1.ct.sectigo.com",            "enabled": True, "priority": "MEDIUM"},
-    {"name": "Sectigo Mammoth2026h2","url": "https://mammoth2026h2.ct.sectigo.com",            "enabled": True, "priority": "MEDIUM"},
-    {"name": "Sectigo Tiger2026h1",  "url": "https://tiger2026h1.ct.sectigo.com",              "enabled": True, "priority": "MEDIUM"},
-    {"name": "Sectigo Tiger2026h2",  "url": "https://tiger2026h2.ct.sectigo.com",              "enabled": True, "priority": "MEDIUM"},
-    {"name": "Sectigo Elephant2026h1","url":"https://elephant2026h1.ct.sectigo.com",           "enabled": True, "priority": "MEDIUM"},
-    {"name": "Sectigo Elephant2026h2","url":"https://elephant2026h2.ct.sectigo.com",           "enabled": True, "priority": "MEDIUM"},
-    {"name": "LE Oak2026h1",         "url": "https://oak.ct.letsencrypt.org/2026h1",           "enabled": True, "priority": "HIGH"},
-    {"name": "LE Oak2026h2",         "url": "https://oak.ct.letsencrypt.org/2026h2",           "enabled": True, "priority": "HIGH"},
-    {"name": "TrustAsia Log2026a",   "url": "https://ct2026-a.trustasia.com/log2026a",         "enabled": True, "priority": "CRITICAL"},
-    {"name": "TrustAsia Log2026b",   "url": "https://ct2026-b.trustasia.com/log2026b",         "enabled": True, "priority": "CRITICAL"},
-    {"name": "TrustAsia HETU2027",   "url": "https://hetu2027.trustasia.com/hetu2027",         "enabled": True, "priority": "HIGH"},
+    {"name": "Google Argon2026h1",    "url": "https://ct.googleapis.com/logs/us1/argon2026h1",  "enabled": True, "priority": "CRITICAL"},
+    {"name": "Google Argon2026h2",    "url": "https://ct.googleapis.com/logs/us1/argon2026h2",  "enabled": True, "priority": "CRITICAL"},
+    {"name": "Google Argon2027h1",    "url": "https://ct.googleapis.com/logs/us1/argon2027h1",  "enabled": True, "priority": "HIGH"},
+    {"name": "Google Xenon2026h1",    "url": "https://ct.googleapis.com/logs/eu1/xenon2026h1",  "enabled": True, "priority": "CRITICAL"},
+    {"name": "Google Xenon2026h2",    "url": "https://ct.googleapis.com/logs/eu1/xenon2026h2",  "enabled": True, "priority": "CRITICAL"},
+    {"name": "Google Xenon2027h1",    "url": "https://ct.googleapis.com/logs/eu1/xenon2027h1",  "enabled": True, "priority": "HIGH"},
+    {"name": "Google Solera2026h1",   "url": "https://ct.googleapis.com/logs/eu1/solera2026h1", "enabled": True, "priority": "MEDIUM"},
+    {"name": "Cloudflare Nimbus2026", "url": "https://ct.cloudflare.com/logs/nimbus2026",       "enabled": True, "priority": "CRITICAL"},
+    {"name": "Cloudflare Nimbus2027", "url": "https://ct.cloudflare.com/logs/nimbus2027",       "enabled": True, "priority": "HIGH"},
+    {"name": "DigiCert Wyvern2026h1", "url": "https://wyvern.ct.digicert.com/2026h1",          "enabled": True, "priority": "HIGH"},
+    {"name": "DigiCert Wyvern2027h1", "url": "https://wyvern.ct.digicert.com/2027h1",          "enabled": True, "priority": "HIGH"},
+    {"name": "DigiCert Wyvern2027h2", "url": "https://wyvern.ct.digicert.com/2027h2",          "enabled": True, "priority": "MEDIUM"},
+    {"name": "DigiCert Sphinx2026h1", "url": "https://sphinx.ct.digicert.com/2026h1",          "enabled": True, "priority": "HIGH"},
+    {"name": "DigiCert Sphinx2027h1", "url": "https://sphinx.ct.digicert.com/2027h1",          "enabled": True, "priority": "HIGH"},
+    {"name": "DigiCert Sphinx2027h2", "url": "https://sphinx.ct.digicert.com/2027h2",          "enabled": True, "priority": "MEDIUM"},
+    {"name": "Sectigo Sabre2026h1",   "url": "https://sabre2026h1.ct.sectigo.com",             "enabled": True, "priority": "HIGH"},
+    {"name": "Sectigo Sabre2026h2",   "url": "https://sabre2026h2.ct.sectigo.com",             "enabled": True, "priority": "MEDIUM"},
+    {"name": "Sectigo Mammoth2026h1", "url": "https://mammoth2026h1.ct.sectigo.com",           "enabled": True, "priority": "MEDIUM"},
+    {"name": "Sectigo Mammoth2026h2", "url": "https://mammoth2026h2.ct.sectigo.com",           "enabled": True, "priority": "MEDIUM"},
+    {"name": "Sectigo Tiger2026h1",   "url": "https://tiger2026h1.ct.sectigo.com",             "enabled": True, "priority": "MEDIUM"},
+    {"name": "Sectigo Tiger2026h2",   "url": "https://tiger2026h2.ct.sectigo.com",             "enabled": True, "priority": "MEDIUM"},
+    {"name": "Sectigo Elephant2026h1","url": "https://elephant2026h1.ct.sectigo.com",          "enabled": True, "priority": "MEDIUM"},
+    {"name": "Sectigo Elephant2026h2","url": "https://elephant2026h2.ct.sectigo.com",          "enabled": True, "priority": "MEDIUM"},
+    {"name": "LE Oak2026h1",          "url": "https://oak.ct.letsencrypt.org/2026h1",          "enabled": True, "priority": "HIGH"},
+    {"name": "LE Oak2026h2",          "url": "https://oak.ct.letsencrypt.org/2026h2",          "enabled": True, "priority": "HIGH"},
+    {"name": "TrustAsia Log2026a",    "url": "https://ct2026-a.trustasia.com/log2026a",        "enabled": True, "priority": "CRITICAL"},
+    {"name": "TrustAsia Log2026b",    "url": "https://ct2026-b.trustasia.com/log2026b",        "enabled": True, "priority": "CRITICAL"},
+    {"name": "TrustAsia HETU2027",    "url": "https://hetu2027.trustasia.com/hetu2027",        "enabled": True, "priority": "HIGH"},
 ]
 
-ENABLED_LOGS    = [log for log in CT_LOGS if log['enabled']]
-NB_LOGS_ACTIFS  = len(ENABLED_LOGS)
+ENABLED_LOGS   = [log for log in CT_LOGS if log['enabled']]
+NB_LOGS_ACTIFS = len(ENABLED_LOGS)
 
 # ==================== STATS ====================
 stats = {
@@ -150,8 +159,10 @@ stats = {
     'js_secrets_found':       0,
     'js_domains_scanned':     0,
     'last_js_scan':           None,
-    'js_false_positives':     0,  # ✅ NOUVEAU
-    'js_false_negatives':     0,  # ✅ NOUVEAU
+    'js_false_positives':     0,
+    'js_false_negatives':     0,
+    'db_write_queue_size':    0,   # ✅ NOUVEAU: monitoring queue DB
+    'db_writes_processed':    0,   # ✅ NOUVEAU
 }
 stats_lock = threading.Lock()
 
@@ -266,7 +277,7 @@ def discord_send(payload: dict):
     except queue.Full:
         with stats_lock:
             stats['discord_dropped'] += 1
-        tprint(f"[DISCORD QUEUE] ⚠️ PLEINE — payload ignoré")
+        tprint("[DISCORD QUEUE] ⚠️ PLEINE — payload ignoré")
 
 _discord_thread = threading.Thread(target=_discord_worker, daemon=True, name="DiscordWorker")
 _discord_thread.start()
@@ -313,33 +324,160 @@ def cleanup_sessions():
 
 weakref.finalize(_session_local, cleanup_sessions)
 
-# ==================== DATABASE ====================
+# ==================== DATABASE WRITER CENTRALISÉ ====================
+# ✅ NOUVEAU: Toutes les écritures passent par une queue unique.
+#    Un seul thread écrit en DB → élimine la contention WAL entre threads.
+#    Les lectures restent thread-local (WAL permet reads concurrents).
+
+class _DBWriteOp:
+    """Représente une opération d'écriture asynchrone."""
+    __slots__ = ('sql', 'params', 'result_future')
+
+    def __init__(self, sql: str, params: tuple, result_future=None):
+        self.sql            = sql
+        self.params         = params
+        self.result_future  = result_future  # threading.Event ou None
+
+_SENTINEL = object()  # signal d'arrêt du writer
+
+class DatabaseWriter:
+    """
+    Thread unique qui consomme la queue des writes.
+    Accumule des micro-batches pour limiter les fsync et améliorer le débit.
+    """
+    def __init__(self, db_path: str, queue_size: int = DB_WRITE_QUEUE_SIZE):
+        self._queue    = queue.Queue(maxsize=queue_size)
+        self._conn     = None
+        self._db_path  = db_path
+        self._thread   = threading.Thread(
+            target=self._run, daemon=True, name="DBWriter"
+        )
+        self._thread.start()
+
+    def _open_conn(self):
+        conn = sqlite3.connect(self._db_path, check_same_thread=True, timeout=60)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA cache_size=-64000')
+        conn.execute('PRAGMA busy_timeout=10000')
+        return conn
+
+    def _run(self):
+        self._conn = self._open_conn()
+        batch = []
+        last_commit = time.monotonic()
+
+        while True:
+            # Attendre la prochaine op (ou timeout pour flush)
+            try:
+                op = self._queue.get(timeout=DB_WRITE_BATCH_TIMEOUT)
+            except queue.Empty:
+                op = None
+
+            if op is _SENTINEL:
+                # Flush final avant arrêt
+                if batch:
+                    self._flush(batch)
+                    batch = []
+                self._conn.close()
+                return
+
+            if op is not None:
+                batch.append(op)
+                self._queue.task_done()
+
+            # Flush si batch plein ou timeout dépassé
+            now = time.monotonic()
+            if batch and (len(batch) >= 200 or (now - last_commit) >= 0.2 or op is None):
+                self._flush(batch)
+                batch = []
+                last_commit = now
+
+    def _flush(self, batch: list):
+        try:
+            cursor = self._conn.cursor()
+            for op in batch:
+                try:
+                    cursor.execute(op.sql, op.params)
+                except sqlite3.IntegrityError:
+                    pass  # UNIQUE violations attendues (INSERT OR IGNORE)
+                except Exception as e:
+                    tprint(f"[DB WRITER] Erreur op: {e} — SQL: {op.sql[:80]}")
+                finally:
+                    if op.result_future:
+                        op.result_future.set()
+            self._conn.commit()
+            with stats_lock:
+                stats['db_writes_processed'] += len(batch)
+                stats['db_write_queue_size']  = self._queue.qsize()
+        except Exception as e:
+            tprint(f"[DB WRITER] Erreur flush: {e}")
+            traceback.print_exc()
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+
+    def execute(self, sql: str, params: tuple = (), wait: bool = False):
+        """
+        Soumet un write.
+        wait=True → bloque jusqu'à ce que l'op soit commitée (pour les cas critiques).
+        wait=False → fire-and-forget (défaut, optimal pour le bulk).
+        """
+        ev = threading.Event() if wait else None
+        op = _DBWriteOp(sql, params, ev)
+        try:
+            self._queue.put(op, timeout=5)
+        except queue.Full:
+            tprint("[DB WRITER] ⚠️ Queue pleine — write ignoré")
+            return
+        if ev:
+            ev.wait(timeout=10)
+
+    def stop(self):
+        self._queue.put(_SENTINEL)
+        self._thread.join(timeout=10)
+
+
+# ==================== DATABASE (READS thread-local, WRITES via DBWriter) ====================
 class CertificateDatabase:
     def __init__(self, db_path):
         self.db_path = db_path
         self._local  = threading.local()
+        # Le writer est initialisé après init_db (qui a besoin d'écrire directement)
+        self._writer: DatabaseWriter | None = None
+        self._init_writer_lock = threading.Lock()
         self.init_db()
+        # Démarrer le writer après l'initialisation du schéma
+        self._writer = DatabaseWriter(db_path)
+        tprint("[DB] DatabaseWriter démarré")
 
-    def _get_conn(self):
+    # ── Connexion READ (thread-local) ──────────────────────────────────────
+    def _get_read_conn(self):
+        """Connexion dédiée aux lectures — une par thread worker."""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
             conn = sqlite3.connect(self.db_path, check_same_thread=True, timeout=30)
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA synchronous=NORMAL')
-            conn.execute('PRAGMA cache_size=-64000')
+            conn.execute('PRAGMA cache_size=-32000')
+            conn.execute('PRAGMA query_only=ON')  # ✅ Sécurité: read-only
             self._local.conn = conn
-            def _close_conn(conn=conn):
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            weakref.finalize(self._local, _close_conn)
+            weakref.finalize(self._local, lambda c=conn: c.close())
         return self._local.conn
 
+    # Alias rétro-compat pour get_conn() utilisé par cleanup_db/dump_db
     def get_conn(self):
-        return self._get_conn()
+        """Connexion directe (lecture/écriture) — usage exceptionnel uniquement."""
+        if not hasattr(self._local, 'rw_conn') or self._local.rw_conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=True, timeout=60)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            self._local.rw_conn = conn
+        return self._local.rw_conn
 
     def init_db(self):
-        conn   = self._get_conn()
+        """Initialisation schéma — exécuté une seule fois au démarrage."""
+        conn   = self.get_conn()
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS subdomains (
@@ -396,14 +534,13 @@ class CertificateDatabase:
         ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS js_scan_history (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                js_url       TEXT UNIQUE NOT NULL,
-                content_hash TEXT,
-                last_scan    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                js_url        TEXT UNIQUE NOT NULL,
+                content_hash  TEXT,
+                last_scan     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 secrets_found INTEGER DEFAULT 0
             )
         ''')
-        # ✅ NOUVEAU: Table pour JS false positives
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS js_false_positives (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -416,6 +553,7 @@ class CertificateDatabase:
             )
         ''')
 
+        # Migration unreachable_domains → subdomains
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='unreachable_domains'")
         if cursor.fetchone():
             cursor.execute('''
@@ -439,115 +577,103 @@ class CertificateDatabase:
         conn.commit()
         tprint(f"[DB] Initialisée: {self.db_path}")
 
-    def subdomain_exists(self, domain):
+    # ── WRITES (via DatabaseWriter) ────────────────────────────────────────
+
+    def subdomain_exists(self, domain) -> bool:
+        """Read — thread-local."""
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            cursor = self._get_read_conn().cursor()
             cursor.execute('SELECT 1 FROM subdomains WHERE domain = ? LIMIT 1', (domain,))
             return cursor.fetchone() is not None
         except Exception as e:
             tprint(f"[DB ERROR] subdomain_exists: {e}")
             return False
 
-    def add_domain(self, domain, base_domain, status_code, log_source):
+    def add_domain(self, domain, base_domain, status_code, log_source) -> bool:
+        """
+        ✅ REFACTORISÉ: Check existence via read conn, write via DBWriter.
+        Retourne True si nouveau, False si update.
+        """
         is_online = 1 if status_code == 200 else 0
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            # Read: vérifier existence
+            cursor = self._get_read_conn().cursor()
             cursor.execute('SELECT 1 FROM subdomains WHERE domain = ? LIMIT 1', (domain,))
-            if cursor.fetchone():
-                cursor.execute(
+            exists = cursor.fetchone() is not None
+
+            if exists:
+                self._writer.execute(
                     'UPDATE subdomains SET status_code=?, is_online=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
                     (status_code, is_online, domain)
                 )
-                conn.commit()
                 return False
-            cursor.execute(
-                'INSERT INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?,?,?,?,?)',
-                (domain, base_domain, status_code, is_online, log_source)
-            )
-            conn.commit()
-            return True
+            else:
+                self._writer.execute(
+                    'INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?,?,?,?,?)',
+                    (domain, base_domain, status_code, is_online, log_source)
+                )
+                return True
         except Exception as e:
             tprint(f"[DB ERROR] add_domain {domain}: {e}")
             return False
 
     def add_subdomain_from_file(self, domain, base_domain, status_code=None):
         is_online = 1 if status_code == 200 else 0
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?,?,?,?,?)',
-                (domain, base_domain, status_code, is_online, "MANUAL_LOAD")
-            )
-            conn.commit()
-            return True
-        except Exception as e:
-            tprint(f"[DB ERROR] add_subdomain_from_file {domain}: {e}")
-            return False
+        self._writer.execute(
+            'INSERT OR IGNORE INTO subdomains (domain, base_domain, status_code, is_online, log_source) VALUES (?,?,?,?,?)',
+            (domain, base_domain, status_code, is_online, "MANUAL_LOAD")
+        )
+        return True
 
     def log_false_positive(self, domain, path, reason):
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO false_positives (domain, path, reason) VALUES (?,?,?)',
-                (domain, path, reason)
-            )
-            conn.commit()
-            with stats_lock:
-                stats['false_positives'] += 1
-        except Exception as e:
-            tprint(f"[DB ERROR] log_false_positive: {e}")
+        self._writer.execute(
+            'INSERT INTO false_positives (domain, path, reason) VALUES (?,?,?)',
+            (domain, path, reason)
+        )
+        with stats_lock:
+            stats['false_positives'] += 1
 
     def log_js_false_positive(self, domain, js_url, secret_type, secret_value, reason):
-        """✅ NOUVEAU: Logger les faux positifs JS"""
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO js_false_positives (domain, js_url, secret_type, secret_value, reason) VALUES (?,?,?,?,?)',
-                (domain, js_url, secret_type, secret_value[:120], reason)
-            )
-            conn.commit()
-            with stats_lock:
-                stats['js_false_positives'] += 1
-        except Exception as e:
-            tprint(f"[DB ERROR] log_js_false_positive: {e}")
+        self._writer.execute(
+            'INSERT INTO js_false_positives (domain, js_url, secret_type, secret_value, reason) VALUES (?,?,?,?,?)',
+            (domain, js_url, secret_type, secret_value[:120], reason)
+        )
+        with stats_lock:
+            stats['js_false_positives'] += 1
 
     def log_anomaly(self, cert_hash, anomaly_type, detail):
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO anomalies (cert_hash, anomaly_type, detail) VALUES (?,?,?)',
-                (cert_hash, anomaly_type, detail)
-            )
-            conn.commit()
-        except Exception as e:
-            tprint(f"[DB ERROR] log_anomaly: {e}")
+        self._writer.execute(
+            'INSERT INTO anomalies (cert_hash, anomaly_type, detail) VALUES (?,?,?)',
+            (cert_hash, anomaly_type, detail)
+        )
 
     def save_js_secret(self, domain, js_url, secret_type, secret_value, context, confidence=50) -> bool:
+        """
+        ✅ REFACTORISÉ: read existence d'abord, puis write via DBWriter.
+        Retourne True si nouveau secret.
+        """
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            cursor = self._get_read_conn().cursor()
             cursor.execute(
+                'SELECT 1 FROM js_secrets WHERE js_url=? AND secret_type=? AND secret_value=? LIMIT 1',
+                (js_url, secret_type, secret_value[:500])
+            )
+            if cursor.fetchone():
+                return False
+            self._writer.execute(
                 '''INSERT OR IGNORE INTO js_secrets
                    (domain, js_url, secret_type, secret_value, context, confidence)
                    VALUES (?,?,?,?,?,?)''',
                 (domain, js_url, secret_type, secret_value[:500], context[:500] if context else '', confidence)
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            return True
         except Exception as e:
             tprint(f"[DB ERROR] save_js_secret: {e}")
             return False
 
     def get_js_scan_history(self, js_url) -> dict | None:
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            cursor = self._get_read_conn().cursor()
             cursor.execute(
                 'SELECT content_hash, last_scan, secrets_found FROM js_scan_history WHERE js_url=?',
                 (js_url,)
@@ -560,26 +686,19 @@ class CertificateDatabase:
             return None
 
     def update_js_scan_history(self, js_url, content_hash, secrets_found):
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                '''INSERT INTO js_scan_history (js_url, content_hash, secrets_found)
-                   VALUES (?,?,?)
-                   ON CONFLICT(js_url) DO UPDATE SET
-                       content_hash=excluded.content_hash,
-                       secrets_found=excluded.secrets_found,
-                       last_scan=CURRENT_TIMESTAMP''',
-                (js_url, content_hash, secrets_found)
-            )
-            conn.commit()
-        except Exception as e:
-            tprint(f"[DB ERROR] update_js_scan_history: {e}")
+        self._writer.execute(
+            '''INSERT INTO js_scan_history (js_url, content_hash, secrets_found)
+               VALUES (?,?,?)
+               ON CONFLICT(js_url) DO UPDATE SET
+                   content_hash=excluded.content_hash,
+                   secrets_found=excluded.secrets_found,
+                   last_scan=CURRENT_TIMESTAMP''',
+            (js_url, content_hash, secrets_found)
+        )
 
     def get_offline(self, limit=100, offset=0):
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            cursor = self._get_read_conn().cursor()
             cursor.execute('''
                 SELECT domain, base_domain, last_check
                 FROM subdomains
@@ -594,8 +713,7 @@ class CertificateDatabase:
 
     def count_offline(self):
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            cursor = self._get_read_conn().cursor()
             cursor.execute('SELECT COUNT(*) FROM subdomains WHERE is_online = 0')
             return cursor.fetchone()[0]
         except Exception:
@@ -605,8 +723,7 @@ class CertificateDatabase:
         offset = 0
         while True:
             try:
-                conn   = self._get_conn()
-                cursor = conn.cursor()
+                cursor = self._get_read_conn().cursor()
                 cursor.execute(
                     'SELECT domain FROM subdomains ORDER BY domain LIMIT ? OFFSET ?',
                     (page_size, offset)
@@ -625,8 +742,7 @@ class CertificateDatabase:
         offset = 0
         while True:
             try:
-                conn   = self._get_conn()
-                cursor = conn.cursor()
+                cursor = self._get_read_conn().cursor()
                 cursor.execute(
                     'SELECT domain FROM subdomains WHERE is_online=1 ORDER BY domain LIMIT ? OFFSET ?',
                     (page_size, offset)
@@ -646,57 +762,39 @@ class CertificateDatabase:
 
     def update_check(self, domain, status_code, response_time_ms):
         is_online = 1 if status_code == 200 else 0
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE subdomains SET status_code=?, is_online=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
-                (status_code, is_online, domain)
-            )
-            cursor.execute(
-                'INSERT INTO check_history (domain, status_code, response_time_ms) VALUES (?,?,?)',
-                (domain, status_code, response_time_ms)
-            )
-            conn.commit()
-            return True
-        except Exception as e:
-            tprint(f"[DB ERROR] update_check {domain}: {e}")
-            return False
+        self._writer.execute(
+            'UPDATE subdomains SET status_code=?, is_online=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
+            (status_code, is_online, domain)
+        )
+        self._writer.execute(
+            'INSERT INTO check_history (domain, status_code, response_time_ms) VALUES (?,?,?)',
+            (domain, status_code, response_time_ms)
+        )
+        return True
 
     def mark_online(self, domain, status_code):
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE subdomains SET is_online=1, status_code=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
-                (status_code, domain)
-            )
-            conn.commit()
-        except Exception as e:
-            tprint(f"[DB ERROR] mark_online {domain}: {e}")
+        self._writer.execute(
+            'UPDATE subdomains SET is_online=1, status_code=?, last_check=CURRENT_TIMESTAMP WHERE domain=?',
+            (status_code, domain)
+        )
 
     def purge_history(self, retention_days=CHECK_HISTORY_RETENTION_DAYS):
-        try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(
-                "DELETE FROM check_history WHERE check_timestamp < datetime('now', ? || ' days')",
-                (f'-{retention_days}',)
-            )
-            deleted = cursor.rowcount
-            conn.commit()
-            if deleted > 0:
-                tprint(f"[DB PURGE] {deleted} entrées supprimées")
-            return deleted
-        except Exception as e:
-            tprint(f"[DB ERROR] purge_history: {e}")
-            return 0
+        """
+        ✅ REFACTORISÉ: soumis en async via writer (non bloquant).
+        Le rowcount n'est pas récupérable en async, on loggue simplement.
+        """
+        self._writer.execute(
+            "DELETE FROM check_history WHERE check_timestamp < datetime('now', ? || ' days')",
+            (f'-{retention_days}',)
+        )
+        tprint(f"[DB PURGE] Purge historique >  {retention_days}j soumise")
+        return 0
 
     def vacuum_optimize(self):
+        # PRAGMA optimize doit passer par une connexion directe (pas via writer)
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute('PRAGMA optimize')
+            conn = self.get_conn()
+            conn.execute('PRAGMA optimize')
             conn.commit()
             tprint("[DB] PRAGMA optimize exécuté")
         except Exception as e:
@@ -704,8 +802,7 @@ class CertificateDatabase:
 
     def count(self):
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            cursor = self._get_read_conn().cursor()
             cursor.execute('SELECT COUNT(*) FROM subdomains')
             return cursor.fetchone()[0]
         except Exception:
@@ -719,8 +816,7 @@ class CertificateDatabase:
 
     def stats_summary(self):
         try:
-            conn   = self._get_conn()
-            cursor = conn.cursor()
+            cursor = self._get_read_conn().cursor()
             cursor.execute('''
                 SELECT
                     COUNT(*) as total,
@@ -806,11 +902,11 @@ stats['positions'] = load_positions()
 # ==================== CIRCUIT BREAKER ====================
 class CircuitBreaker:
     def __init__(self, failure_threshold=3):
-        self.failures        = 0
-        self.threshold       = failure_threshold
-        self.is_open         = False
-        self.lock            = threading.Lock()
-        self.last_fail_time  = None
+        self.failures       = 0
+        self.threshold      = failure_threshold
+        self.is_open        = False
+        self.lock           = threading.Lock()
+        self.last_fail_time = None
 
     def record_success(self):
         with self.lock:
@@ -849,16 +945,14 @@ def retry_with_backoff(func, max_retries=HTTP_CHECK_RETRIES, timeout_base=1):
         try:
             return func()
         except Exception as e:
-            if attempt == max_retries - 1:
-                tprint(f"[RETRY] All {max_retries} attempts failed.")
-            else:
+            if attempt < max_retries - 1:
                 tprint(f"[RETRY] Attempt {attempt+1}/{max_retries} failed: {str(e)[:100]}")
-            if attempt == max_retries - 1:
-                return None
-            wait_time = timeout_base * (2 ** attempt)
-            with stats_lock:
-                stats['retry_http'] += 1
-            time.sleep(wait_time)
+                wait_time = timeout_base * (2 ** attempt)
+                with stats_lock:
+                    stats['retry_http'] += 1
+                time.sleep(wait_time)
+            else:
+                tprint(f"[RETRY] All {max_retries} attempts failed.")
     return None
 
 # ==================== ECHO-SERVER DETECTION ====================
@@ -886,7 +980,7 @@ def is_echo_server_response(content: str, requested_path: str) -> tuple:
             return (True, f"echo-server: path reflété '{response_path}'")
     if isinstance(data.get('headers'), dict):
         response_headers_keys = set(k.lower() for k in data['headers'].keys())
-        matching_markers      = response_headers_keys & ECHO_SERVER_HEADER_MARKERS
+        matching_markers = response_headers_keys & ECHO_SERVER_HEADER_MARKERS
         if len(matching_markers) >= 2 and 'method' in keys:
             return (True, f"echo-server: headers internes reflétés {matching_markers}")
     if isinstance(data.get('os'), dict) and 'hostname' in data.get('os', {}):
@@ -1058,7 +1152,6 @@ def load_targets():
 
 targets = load_targets()
 
-# (Continuer à la Partie 2/2...)
 # ==================== PATH MONITOR ====================
 class PathMonitor:
     DEFAULT_PATHS = [
@@ -1156,12 +1249,12 @@ class PathMonitor:
         if len(content) > 1900:
             preview += f"\n... (tronqué, taille: {len(content)} chars)"
         embed = {
-            "title": "✅ Fichier sensible accessible",
+            "title":       "✅ Fichier sensible accessible",
             "description": f"`{url}`\n\n```\n{preview}\n```",
-            "color": 0x00ff00,
+            "color":       0x00ff00,
             "fields": [
-                {"name": "Taille",  "value": f"{len(content)} bytes", "inline": True},
-                {"name": "Status",  "value": "200 OK",                "inline": True},
+                {"name": "Taille", "value": f"{len(content)} bytes", "inline": True},
+                {"name": "Status", "value": "200 OK",                "inline": True},
             ],
             "footer":    {"text": "CT Monitor"},
             "timestamp": datetime.utcnow().isoformat()
@@ -1169,13 +1262,13 @@ class PathMonitor:
         discord_send({"embeds": [embed]})
         tprint(f"[PATHS ALERT] Fichier sensible: {url}")
 
-    def check_domain_paths(self, domain):
+    def check_domain_paths(self, domain) -> tuple:
         host, port = parse_subdomain_entry(domain)
         found = errors = checked = 0
         for path in self.paths:
             for protocol in ['https', 'http']:
-                url                               = f"{protocol}://{host}{path}"
-                status_code, content, response_time, error = self.check_path(url)
+                url                                          = f"{protocol}://{host}{path}"
+                status_code, content, response_time, error  = self.check_path(url)
                 checked += 1
                 if status_code == 200 and content:
                     tprint(f"[PATHS] ✅ TROUVE: {url} [{len(content)} bytes]")
@@ -1190,37 +1283,53 @@ class PathMonitor:
         return found, checked, errors
 
     def check_all(self):
+        """
+        ✅ REFACTORISÉ: collecte des résultats optimisée avec as_completed.
+        Soumet par batch de SUBMIT_BATCH, flush au fil de l'eau.
+        """
         total_found = total_checked = total_errors = 0
         domain_count = 0
         start        = time.time()
         MAX_WORKERS  = 50
         SUBMIT_BATCH = 200
+
         tprint(f"[PATHS CRON] Debut scan ({len(self.paths)} paths/domaine)...")
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="PathCheck") as executor:
-            batch_futures = {}
+            futures = {}
+
+            def _flush_done():
+                nonlocal total_found, total_checked, total_errors
+                done = [f for f in futures if f.done()]
+                for f in done:
+                    try:
+                        found, checked, errors = f.result()
+                        total_found   += found
+                        total_checked += checked
+                        total_errors  += errors
+                    except Exception as e:
+                        tprint(f"[PATHS ERROR] {futures[f]}: {str(e)[:80]}")
+                    del futures[f]
+
             for domain in db.iter_all_domains(page_size=SUBMIT_BATCH):
                 domain_count += 1
-                future                  = executor.submit(self.check_domain_paths, domain)
-                batch_futures[future]   = domain
-                if len(batch_futures) >= SUBMIT_BATCH:
-                    done_futures = [f for f in batch_futures if f.done()]
-                    for f in done_futures:
-                        try:
-                            found, checked, errors  = f.result()
-                            total_found   += found
-                            total_checked += checked
-                            total_errors  += errors
-                        except Exception as e:
-                            tprint(f"[PATHS ERROR] {batch_futures[f]}: {str(e)[:80]}")
-                        del batch_futures[f]
-            for future in as_completed(batch_futures):
+                future         = executor.submit(self.check_domain_paths, domain)
+                futures[future] = domain
+
+                # Flush les futures terminées pour libérer la mémoire
+                if len(futures) >= SUBMIT_BATCH:
+                    _flush_done()
+
+            # Attendre les futures restantes
+            for future in as_completed(futures):
                 try:
                     found, checked, errors = future.result()
                     total_found   += found
                     total_checked += checked
                     total_errors  += errors
                 except Exception as e:
-                    tprint(f"[PATHS ERROR] {batch_futures[future]}: {str(e)[:80]}")
+                    tprint(f"[PATHS ERROR] {futures[future]}: {str(e)[:80]}")
+
         elapsed = int(time.time() - start)
         tprint(f"[PATHS CRON] Scan terminé — {domain_count} domaines en {elapsed}s")
         tprint(f"[PATHS CRON] Requetes: {total_checked} | erreurs: {total_errors}")
@@ -1231,141 +1340,93 @@ class PathMonitor:
         if total_found > 0:
             tprint(f"[PATHS CRON] ⚠️ {total_found} fichier(s) sensible(s) trouvé(s) !")
         else:
-            tprint(f"[PATHS CRON] ✅ Aucun fichier sensible trouvé")
+            tprint("[PATHS CRON] ✅ Aucun fichier sensible trouvé")
 
 path_monitor = PathMonitor(PATHS_FILE)
 
-# ==================== JS SECRET PATTERNS ULTRA-STRICT (ZERO FALSE POSITIVES) ====================
-# ✅ NOUVELLE VERSION 4.3.2 - Patterns raffinés + validation format
-
+# ==================== JS SECRET PATTERNS ====================
 JS_SECRET_PATTERNS_RAW = {
-    # ── AWS ───────────────────────────────────────────────────────────────────────────────────
-    'AWS Access Key ID': r'\bAKIA[0-9A-Z]{16}\b',
-    'AWS Secret Access Key': r'\bwsu4ecoCS[A-Za-z0-9/+]{30,40}\b',
-    'AWS Session Token': r'(?:AQoDY|AQAB)[A-Za-z0-9/+=]{200,}',
-    
-    # ── GCP ───────────────────────────────────────────────────────────────────────────────────
-    'GCP API Key': r'\bAIza[0-9A-Za-z\-_]{35}\b',
-    'GCP Service Account Key': r'"type":\s*"service_account"[^}]{100,}?"client_id":\s*"[0-9]+-[a-z0-9]{20}\.apps\.googleusercontent\.com"',
-    
-    # ── GitHub ────────────────────────────────────────────────────────────────────────────────
-    'GitHub Personal Token': r'\bghp_[0-9a-zA-Z]{36}\b',
-    'GitHub OAuth Token': r'\bgho_[0-9a-zA-Z]{36}\b',
-    'GitHub App Token': r'\bghu_[0-9a-zA-Z]{36}\b',
-    
-    # ── Stripe ────────────────────────────────────────────────────────────────────────────────
+    'AWS Access Key ID':      r'\bAKIA[0-9A-Z]{16}\b',
+    'AWS Secret Access Key':  r'\bwsu4ecoCS[A-Za-z0-9/+]{30,40}\b',
+    'AWS Session Token':      r'(?:AQoDY|AQAB)[A-Za-z0-9/+=]{200,}',
+    'GCP API Key':            r'\bAIza[0-9A-Za-z\-_]{35}\b',
+    'GCP Service Account Key':r'"type":\s*"service_account"[^}]{100,}?"client_id":\s*"[0-9]+-[a-z0-9]{20}\.apps\.googleusercontent\.com"',
+    'GitHub Personal Token':  r'\bghp_[0-9a-zA-Z]{36}\b',
+    'GitHub OAuth Token':     r'\bgho_[0-9a-zA-Z]{36}\b',
+    'GitHub App Token':       r'\bghu_[0-9a-zA-Z]{36}\b',
     'Stripe Secret Key Live': r'\bsk_live_[0-9a-zA-Z]{24,}\b',
-    'Stripe API Key': r'\brk_live_[0-9a-zA-Z]{24,}\b',
-    
-    # ── Database URIs ─────────────────────────────────────────────────────────────────────────
-    'PostgreSQL Connection': r'postgres://[a-zA-Z0-9_-]+:[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:\'",.<>?/~`]{8,}@[a-zA-Z0-9.-]+(?::\d+)?/[a-zA-Z0-9_-]+',
-    'MySQL Connection': r'mysql://[a-zA-Z0-9_-]+:[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:\'",.<>?/~`]{8,}@[a-zA-Z0-9.-]+(?::\d+)?/[a-zA-Z0-9_-]+',
-    'MongoDB Connection': r'mongodb(?:\+srv)?://[a-zA-Z0-9_-]+:[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:\'",.<>?/~`]{8,}@[a-zA-Z0-9.-]+(?::\d+)?/[a-zA-Z0-9_-]+',
-    
-    # ── Private Keys (FULL BLOCKS REQUIRED) ────────────────────────────────────────────────────
-    'RSA Private Key': r'-----BEGIN RSA PRIVATE KEY-----\s+[A-Za-z0-9+/\s]{100,}-----END RSA PRIVATE KEY-----',
-    'EC Private Key': r'-----BEGIN EC PRIVATE KEY-----\s+[A-Za-z0-9+/\s]{100,}-----END EC PRIVATE KEY-----',
-    'OpenSSH Private Key': r'-----BEGIN OPENSSH PRIVATE KEY-----\s+[A-Za-z0-9+/\s]{100,}-----END OPENSSH PRIVATE KEY-----',
-    'PGP Private Key': r'-----BEGIN PGP PRIVATE KEY BLOCK-----\s+[A-Za-z0-9+/\s]{200,}-----END PGP PRIVATE KEY BLOCK-----',
-    
-    # ── JWT Tokens (✅ PATTERN AMÉLIORÉ - baissé le seuil) ────────────────────────────────────
-    'JWT Token': r'\beyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\b',
-    
-    # ── Communication APIs ────────────────────────────────────────────────────────────────────
-    'Slack Bot Token': r'\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[0-9a-zA-Z]{24}\b',
-    'Discord Bot Token': r'\b[MN][A-Za-z0-9_\-]{23,25}\.[A-Za-z0-9_\-]{6,8}\.[A-Za-z0-9_\-]{25,38}\b',
-    'Telegram Bot Token': r'\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b',
-    
-    # ── Payment Processing ────────────────────────────────────────────────────────────────────
-    'Stripe Webhook Secret': r'\bwhsec_[A-Za-z0-9_\-]{32,}\b',
-    
-    # ── Cloud Provider Tokens ─────────────────────────────────────────────────────────────────
-    'Heroku API Key': r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
-    'DigitalOcean Token': r'\bdop_v1_[a-f0-9]{64}\b',
-    
-    # ── CI/CD Tokens (✅ PATTERN AMÉLIORÉ - moins générique) ───────────────────────────────
-    'CircleCI Token': r'\b[a-f0-9]{40}(?:[a-f0-9]{20})?\b(?![\-])(?<![a-z0-9-])',
-    'Travis CI Token': r'\b[a-zA-Z0-9_-]{100,}\b',
+    'Stripe API Key':         r'\brk_live_[0-9a-zA-Z]{24,}\b',
+    'PostgreSQL Connection':  r'postgres://[a-zA-Z0-9_-]+:[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:\'",.<>?/~`]{8,}@[a-zA-Z0-9.-]+(?::\d+)?/[a-zA-Z0-9_-]+',
+    'MySQL Connection':       r'mysql://[a-zA-Z0-9_-]+:[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:\'",.<>?/~`]{8,}@[a-zA-Z0-9.-]+(?::\d+)?/[a-zA-Z0-9_-]+',
+    'MongoDB Connection':     r'mongodb(?:\+srv)?://[a-zA-Z0-9_-]+:[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};:\'",.<>?/~`]{8,}@[a-zA-Z0-9.-]+(?::\d+)?/[a-zA-Z0-9_-]+',
+    'RSA Private Key':        r'-----BEGIN RSA PRIVATE KEY-----\s+[A-Za-z0-9+/\s]{100,}-----END RSA PRIVATE KEY-----',
+    'EC Private Key':         r'-----BEGIN EC PRIVATE KEY-----\s+[A-Za-z0-9+/\s]{100,}-----END EC PRIVATE KEY-----',
+    'OpenSSH Private Key':    r'-----BEGIN OPENSSH PRIVATE KEY-----\s+[A-Za-z0-9+/\s]{100,}-----END OPENSSH PRIVATE KEY-----',
+    'PGP Private Key':        r'-----BEGIN PGP PRIVATE KEY BLOCK-----\s+[A-Za-z0-9+/\s]{200,}-----END PGP PRIVATE KEY BLOCK-----',
+    'JWT Token':              r'\beyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\b',
+    'Slack Bot Token':        r'\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[0-9a-zA-Z]{24}\b',
+    'Discord Bot Token':      r'\b[MN][A-Za-z0-9_\-]{23,25}\.[A-Za-z0-9_\-]{6,8}\.[A-Za-z0-9_\-]{25,38}\b',
+    'Telegram Bot Token':     r'\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b',
+    'Stripe Webhook Secret':  r'\bwhsec_[A-Za-z0-9_\-]{32,}\b',
+    'Heroku API Key':         r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
+    'DigitalOcean Token':     r'\bdop_v1_[a-f0-9]{64}\b',
+    'CircleCI Token':         r'\b[a-f0-9]{40}(?:[a-f0-9]{20})?\b(?![\-])(?<![a-z0-9-])',
+    'Travis CI Token':        r'\b[a-zA-Z0-9_-]{100,}\b',
 }
 
-# CRITICAL ALLOWLIST - Filtrer TOUS les faux positifs avant détection
 JS_SECRET_ALLOWLIST_VALUES = {
-    # Placeholders
     'your_api_key', 'your_secret_key', 'your_secret', 'your_token', 'your_password',
     'insert_key_here', 'enter_your_key', 'api_key_here', 'example', 'test', 'demo',
     'fake', 'dummy', 'placeholder', 'changeme', 'replace_me', 'update_this',
-    
-    # Unicode patterns (traductions)
     'كلمة', 'المرور', 'contraseña', 'مرور', 'пароль', '密码',
-    
-    # Validation messages
     'passwords must be at least', 'password must be', 'at least 8 characters',
     'confirm your password', 'enter your password', 'validation error',
     'must match', 'required field', 'invalid format', 'invalid input',
-    
-    # UI Elements & Code
     'ql-password', '#password', 'password_field', 'expandwildcard',
     'generaldemo', 'summer2023', 'demo2024', 'test123', 'admin123',
     'qwerty', 'password123', 'letmein', 'welcome', 'admin',
-    
-    # Patterns courants
     '0000000000000000', '1111111111111111',
     'abcdefghijklmnop', 'abcdefghijklmnopqrstuvwxyz',
     'xxxxxxxxxxxxxxxx', 'yyyyyyyyyyyyyyyy',
-    
-    # Hashes SHA/MD5
     '5d41402abc4b2a76b9719d911017c592',
     'da39a3ee5e6b4b0d3255bfef95601890afd80709',
 }
 
-# Compiler tous les patterns
 JS_SECRET_COMPILED = {
     name: re.compile(pattern, re.MULTILINE | re.DOTALL)
     for name, pattern in JS_SECRET_PATTERNS_RAW.items()
 }
 
-tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns ULTRA-STRICT compilés (v4.3.2)")
+tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns ULTRA-STRICT compilés (v4.4.0)")
 
-# ==================== JS SECRET SCANNER (✅ VERSION 4.3.2 AMÉLIORÉE) ====================
+# ==================== JS SECRET SCANNER (PARALLÉLISÉ) ====================
 class JSScanner:
-
-    # ✅ NOUVEAU: Validateurs de format strict
     SECRET_VALIDATORS = {
-        'AWS Access Key ID': lambda v: len(v) == 20 and v.isupper(),
-        'AWS Secret Access Key': lambda v: 30 <= len(v) <= 40,
-        'AWS Session Token': lambda v: 100 <= len(v) <= 300,
-        
-        'GCP API Key': lambda v: len(v) == 39 and v.startswith('AIza'),
-        
-        'GitHub Personal Token': lambda v: len(v) == 36 and v.isalnum(),
-        'GitHub OAuth Token': lambda v: len(v) == 36 and v.isalnum(),
-        'GitHub App Token': lambda v: len(v) == 36 and v.isalnum(),
-        
+        'AWS Access Key ID':      lambda v: len(v) == 20 and v.isupper(),
+        'AWS Secret Access Key':  lambda v: 30 <= len(v) <= 40,
+        'AWS Session Token':      lambda v: 100 <= len(v) <= 300,
+        'GCP API Key':            lambda v: len(v) == 39 and v.startswith('AIza'),
+        'GitHub Personal Token':  lambda v: len(v) == 36 and v.isalnum(),
+        'GitHub OAuth Token':     lambda v: len(v) == 36 and v.isalnum(),
+        'GitHub App Token':       lambda v: len(v) == 36 and v.isalnum(),
         'Stripe Secret Key Live': lambda v: len(v) >= 24 and '_' in v,
-        'Stripe Webhook Secret': lambda v: len(v) >= 32,
-        
-        'JWT Token': lambda v: v.count('.') == 2 and len(v) > 30,
-        
-        'PostgreSQL Connection': lambda v: 'postgres://' in v,
-        'MySQL Connection': lambda v: 'mysql://' in v,
-        'MongoDB Connection': lambda v: 'mongodb' in v and '://' in v,
-        
-        'RSA Private Key': lambda v: 'BEGIN RSA PRIVATE KEY' in v,
-        'EC Private Key': lambda v: 'BEGIN EC PRIVATE KEY' in v,
-        'OpenSSH Private Key': lambda v: 'BEGIN OPENSSH PRIVATE KEY' in v,
-        
-        'Slack Bot Token': lambda v: v.startswith('xoxb-') and len(v) > 40,
-        'Discord Bot Token': lambda v: (v.startswith('M') or v.startswith('N')) and '.' in v,
-        'Telegram Bot Token': lambda v: re.match(r'^\d{8,10}:AA[A-Za-z0-9_-]{33}$', v),
-        
-        'Heroku API Key': lambda v: re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', v),
-        'DigitalOcean Token': lambda v: v.startswith('dop_v1_') and len(v) > 40,
-        
-        'CircleCI Token': lambda v: len(v) >= 40 and not any(c in v for c in ['-', '.']),
+        'Stripe Webhook Secret':  lambda v: len(v) >= 32,
+        'JWT Token':              lambda v: v.count('.') == 2 and len(v) > 30,
+        'PostgreSQL Connection':  lambda v: 'postgres://' in v,
+        'MySQL Connection':       lambda v: 'mysql://' in v,
+        'MongoDB Connection':     lambda v: 'mongodb' in v and '://' in v,
+        'RSA Private Key':        lambda v: 'BEGIN RSA PRIVATE KEY' in v,
+        'EC Private Key':         lambda v: 'BEGIN EC PRIVATE KEY' in v,
+        'OpenSSH Private Key':    lambda v: 'BEGIN OPENSSH PRIVATE KEY' in v,
+        'Slack Bot Token':        lambda v: v.startswith('xoxb-') and len(v) > 40,
+        'Discord Bot Token':      lambda v: (v.startswith('M') or v.startswith('N')) and '.' in v,
+        'Telegram Bot Token':     lambda v: re.match(r'^\d{8,10}:AA[A-Za-z0-9_-]{33}$', v),
+        'Heroku API Key':         lambda v: re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', v),
+        'DigitalOcean Token':     lambda v: v.startswith('dop_v1_') and len(v) > 40,
+        'CircleCI Token':         lambda v: len(v) >= 40 and not any(c in v for c in ['-', '.']),
     }
-    
+
     def _validate_secret_format(self, secret_type: str, value: str) -> bool:
-        """✅ NOUVEAU: Valide le format exact du secret."""
         if secret_type not in self.SECRET_VALIDATORS:
             return True
         try:
@@ -1377,165 +1438,80 @@ class JSScanner:
         return hashlib.sha256(content.encode('utf-8', errors='replace')).hexdigest()[:16]
 
     def _is_allowlisted_value(self, value: str, secret_type: str = None) -> bool:
-        """✅ AMÉLIORÉ: Filtre intelligent avec min_length par type."""
         v = value.strip().lower()
-        
-        # ✅ NOUVEAU: Min length PAR TYPE (pas de blanket 16)
         MIN_LENGTHS = {
-            'AWS Access Key ID': 20,
-            'AWS Secret Access Key': 30,
-            'GitHub Personal Token': 36,
-            'Stripe Secret Key Live': 24,
-            'JWT Token': 30,  # ↓ Baissé de 50 → 30
-            'CircleCI Token': 32,
-            'Heroku API Key': 36,
-            'Slack Bot Token': 40,
-            'Discord Bot Token': 30,  # ↓ Baissé de 50 → 30
+            'AWS Access Key ID': 20, 'AWS Secret Access Key': 30,
+            'GitHub Personal Token': 36, 'Stripe Secret Key Live': 24,
+            'JWT Token': 30, 'CircleCI Token': 32, 'Heroku API Key': 36,
+            'Slack Bot Token': 40, 'Discord Bot Token': 30,
         }
-        
         min_len = MIN_LENGTHS.get(secret_type, 16)
         if len(v) < min_len:
             return True
-        
-        # Dans la liste noire
         if v in JS_SECRET_ALLOWLIST_VALUES:
             return True
-        
-        # Unicode encodé
         if '\\u' in value or (value and '\u0000' <= value[0] <= '\u001f'):
             return True
-        
-        # Contient mots-clés validation + court
         validation_kw = ['must be', 'password', 'confirm', 'enter', 'invalid', 'required', 'error']
         if any(kw in v for kw in validation_kw) and len(v) < 50:
             return True
-        
-        # CamelCase code
         if re.match(r'^[a-z]+(?:[a-z]*[A-Z][a-z]+){2,}$', v):
             return True
-        
-        # Peu caractères uniques (hash/répétition)
-        unique_chars = len(set(v))
-        if unique_chars < 8:  # ↑ De 5 → 8
+        if len(set(v)) < 8:
             return True
-        
-        # Que chiffres
         if v.isdigit() and len(v) < 50:
             return True
-        
-        # HTML/template
         if '<' in v or '[' in v or '{' in v:
             return True
-        
         return False
 
     def _extract_context(self, content: str, match) -> str:
-        """✅ AMÉLIORÉ: Extraire ligne COMPLÈTE + contexte (300 chars)."""
-        # Chercher les limites de ligne
         line_start = content.rfind('\n', 0, match.start())
-        if line_start == -1:
-            line_start = 0
-        else:
-            line_start += 1
-        
-        line_end = content.find('\n', match.end())
-        if line_end == -1:
-            line_end = len(content)
-        
-        # Retourner la ligne complète (max 500 chars)
-        full_line = content[line_start:line_end]
-        if len(full_line) > 500:
-            full_line = full_line[:500]
-        
-        return full_line
+        line_start = 0 if line_start == -1 else line_start + 1
+        line_end   = content.find('\n', match.end())
+        line_end   = len(content) if line_end == -1 else line_end
+        return content[line_start:line_end][:500]
 
     def _calculate_confidence(self, secret_type: str, value: str, context: str) -> int:
-        """✅ AMÉLIORÉ: Calcul STRICT de confiance avec bonus/malus contexte."""
         base_scores = {
-            'AWS Access Key ID': 95,
-            'AWS Secret Access Key': 95,
-            'GCP API Key': 95,
-            'GCP Service Account Key': 95,
-            'GitHub Personal Token': 95,
-            'GitHub OAuth Token': 95,
-            'GitHub App Token': 95,
-            'Stripe Secret Key Live': 95,
-            'RSA Private Key': 95,
-            'EC Private Key': 95,
-            'OpenSSH Private Key': 95,
-            'PGP Private Key': 95,
-            'PostgreSQL Connection': 95,
-            'MySQL Connection': 95,
-            'MongoDB Connection': 95,
-            
-            'Slack Bot Token': 85,
-            'Discord Bot Token': 85,
-            'Telegram Bot Token': 85,
-            'Stripe Webhook Secret': 85,
-            'DigitalOcean Token': 85,
-            'Heroku API Key': 85,
-            
-            'JWT Token': 75,  # ↑ De 70 → 75
-            'CircleCI Token': 75,
-            'Travis CI Token': 75,
+            'AWS Access Key ID': 95, 'AWS Secret Access Key': 95,
+            'GCP API Key': 95, 'GCP Service Account Key': 95,
+            'GitHub Personal Token': 95, 'GitHub OAuth Token': 95, 'GitHub App Token': 95,
+            'Stripe Secret Key Live': 95, 'RSA Private Key': 95, 'EC Private Key': 95,
+            'OpenSSH Private Key': 95, 'PGP Private Key': 95,
+            'PostgreSQL Connection': 95, 'MySQL Connection': 95, 'MongoDB Connection': 95,
+            'Slack Bot Token': 85, 'Discord Bot Token': 85, 'Telegram Bot Token': 85,
+            'Stripe Webhook Secret': 85, 'DigitalOcean Token': 85, 'Heroku API Key': 85,
+            'JWT Token': 75, 'CircleCI Token': 75, 'Travis CI Token': 75,
         }
-        
-        confidence = base_scores.get(secret_type, 50)
+        confidence    = base_scores.get(secret_type, 50)
         context_lower = context.lower()
-        
-        # ════════════════════════════════════════════════════════════
-        # MALUS (Réduisent la confiance)
-        # ════════════════════════════════════════════════════════════
-        
-        # Test/Dev/Demo context (-25%)
         if any(w in context_lower for w in ['testing', 'dev', 'demo', 'test', 'staging', 'sandbox']):
             confidence -= 25
-        
-        # Example/Doc (-20%)
         if any(w in context_lower for w in ['example', 'documentation', 'doc', 'guide', 'readme']):
             confidence -= 20
-        
-        # Fake/Mock/Dummy (-30%)
         if any(w in context_lower for w in ['fake', 'mock', 'dummy', 'placeholder', 'sample']):
             confidence -= 30
-        
-        # Variable commence par TEST/EXAMPLE (-20%)
         if re.search(r'\b(TEST|EXAMPLE|DEMO|SAMPLE|FAKE)_[A-Z_]*\s*[=:]', context, re.IGNORECASE):
             confidence -= 20
-        
-        # ════════════════════════════════════════════════════════════
-        # BONUS (Augmentent la confiance)
-        # ════════════════════════════════════════════════════════════
-        
-        # Production context (+20%)
         if any(w in context_lower for w in ['production', 'prod', 'live', 'real', 'actual']):
             confidence += 20
-        
-        # API key/secret context (+15%)
         if re.search(r'(api_key|api_secret|password|secret|token|credential)\s*[=:]', context_lower):
             confidence += 15
-        
-        # URL API context (+10%)
         if re.search(r'(api_url|endpoint|https?://)', context_lower):
             confidence += 10
-        
-        # Variable commence par PROD/REAL (+15%)
         if re.search(r'\b(PROD|PRODUCTION|REAL|LIVE)_', context, re.IGNORECASE):
             confidence += 15
-        
-        # Format validation bonus (+5%) / malus (-30%)
         if self._validate_secret_format(secret_type, value):
             confidence += 5
         else:
             confidence -= 30
-        
         return max(0, min(100, confidence))
 
     def extract_js_urls(self, html: str, base_url: str) -> list:
         parsed_base = urlparse(base_url)
         base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
         found_urls  = set()
-
         for m in re.finditer(
             r'<script[^>]+src\s*=\s*["\']([^"\']+\.js(?:\?[^"\']*)?)["\']',
             html, re.IGNORECASE
@@ -1549,67 +1525,48 @@ class JSScanner:
                 url = f"{base_origin}{src}"
             else:
                 url = urljoin(base_url, src)
-
             parsed_url = urlparse(url)
             if parsed_base.netloc not in parsed_url.netloc and parsed_url.netloc not in parsed_base.netloc:
                 continue
-            
-            # Bloquer libs connues
             if any(lib in url.lower() for lib in ['node_modules', 'jquery', 'bootstrap', 'react', 'angular', 'polyfill', 'chunk', 'vendor']):
                 continue
-            
             found_urls.add(url.split('?')[0])
-
         return list(found_urls)[:MAX_JS_PER_DOMAIN]
 
     def scan_js_content(self, content: str, js_url: str, domain: str = "") -> list:
-        """✅ AMÉLIORÉ: Scan avec logging des rejets."""
-        findings   = []
-        seen_vals  = set()
-        rejected_secrets = []  # ✅ NOUVEAU: Track rejets
+        findings         = []
+        seen_vals        = set()
+        rejected_secrets = []
 
         for secret_type, pattern in JS_SECRET_COMPILED.items():
             try:
                 for match in pattern.finditer(content):
                     value = (match.group(1) if match.lastindex and match.group(1) else match.group(0)).strip()
-
                     if not value or value in seen_vals:
                         continue
-                    
-                    # ✅ NOUVEAU: Logger rejets
                     if self._is_allowlisted_value(value, secret_type):
                         rejected_secrets.append(('allowlist', secret_type, value[:50]))
                         continue
-                    
                     if not self._validate_secret_format(secret_type, value):
                         rejected_secrets.append(('format_invalid', secret_type, value[:50]))
-                        # ✅ NOUVEAU: Logger FP
                         if domain:
                             db.log_js_false_positive(domain, js_url, secret_type, value[:120], "Format invalide")
                         continue
-
                     seen_vals.add(value)
-                    context = self._extract_context(content, match)
+                    context    = self._extract_context(content, match)
                     confidence = self._calculate_confidence(secret_type, value, context)
-                    
                     if confidence < 75:
                         rejected_secrets.append(('low_confidence', secret_type, f"{confidence}%"))
-                        # ✅ NOUVEAU: Logger FP
                         if domain:
                             db.log_js_false_positive(domain, js_url, secret_type, value[:120], f"Confiance basse: {confidence}%")
                         continue
-
                     findings.append({
-                        'type':       secret_type,
-                        'value':      value[:120],
-                        'context':    context,
-                        'url':        js_url,
-                        'confidence': confidence,
+                        'type': secret_type, 'value': value[:120],
+                        'context': context, 'url': js_url, 'confidence': confidence,
                     })
             except Exception:
                 continue
-        
-        # ✅ NOUVEAU: Log des rejets pour audit
+
         if rejected_secrets and len(rejected_secrets) <= 15:
             tprint(f"[JS SCAN] {js_url}: {len(rejected_secrets)} secret(s) rejeté(s)")
             for reason, stype, val in rejected_secrets[:5]:
@@ -1623,14 +1580,11 @@ class JSScanner:
         try:
             with _http_semaphore:
                 resp = session.get(js_url, timeout=JS_SCAN_TIMEOUT, stream=True, allow_redirects=True)
-            
             if resp.status_code != 200:
                 return (None, None, 0)
-
             tmp_fd, tmp_path = tempfile.mkstemp(suffix='.js', prefix='ct_js_', dir='/tmp')
-            total = 0
+            total  = 0
             hasher = hashlib.sha256()
-
             with os.fdopen(tmp_fd, 'wb') as tmp_f:
                 for chunk in resp.iter_content(chunk_size=16384):
                     if chunk:
@@ -1639,10 +1593,7 @@ class JSScanner:
                         total += len(chunk)
                         if total >= MAX_JS_SIZE:
                             break
-
-            content_hash = hasher.hexdigest()[:16]
-            return (tmp_path, content_hash, total)
-
+            return (tmp_path, hasher.hexdigest()[:16], total)
         except Exception as e:
             tprint(f"[JS DL] Erreur {js_url}: {str(e)[:60]}")
             if tmp_path and os.path.exists(tmp_path):
@@ -1660,17 +1611,17 @@ class JSScanner:
                 tprint(f"[JS SCAN] Erreur suppression {tmp_path}: {e}")
 
     def scan_domain(self, domain: str) -> list:
+        """Scan un domaine — conçu pour être appelé depuis un thread worker."""
         all_findings = []
-        session = get_session()
-        html = None
-        final_url = None
+        session      = get_session()
+        html = final_url = None
 
         for protocol in ['https', 'http']:
             try:
                 with _http_semaphore:
                     resp = session.get(f"{protocol}://{domain}", timeout=JS_SCAN_TIMEOUT, allow_redirects=True)
                 if resp.status_code == 200:
-                    html = resp.text
+                    html      = resp.text
                     final_url = resp.url
                     break
             except Exception:
@@ -1707,8 +1658,7 @@ class JSScanner:
                 with open(tmp_path, 'r', encoding='utf-8', errors='replace') as f:
                     js_content = f.read()
 
-                findings = self.scan_js_content(js_content, js_url, domain)  # ✅ Passer domain
-
+                findings = self.scan_js_content(js_content, js_url, domain)
                 db.update_js_scan_history(js_url, content_hash, len(findings))
 
                 with stats_lock:
@@ -1728,7 +1678,6 @@ class JSScanner:
 
             except Exception as e:
                 tprint(f"[JS SCAN] Erreur scan {js_url}: {str(e)[:80]}")
-
             finally:
                 self._delete_tmp(tmp_path)
                 tmp_path = None
@@ -1738,91 +1687,84 @@ class JSScanner:
     def send_js_alert(self, domain: str, findings: list):
         if not findings:
             return
-
         by_url = {}
         for f in findings:
             by_url.setdefault(f['url'], []).append(f)
-
-        fields = []
+        fields         = []
         critical_count = 0
-        
         for js_url, js_findings in list(by_url.items())[:10]:
             lines = []
             for f in js_findings[:6]:
                 val_preview = f['value'][:50] + ('...' if len(f['value']) > 50 else '')
-                conf = f.get('confidence', 50)
-                
+                conf        = f.get('confidence', 50)
                 if conf >= 95:
-                    icon = "🔴"
-                    critical_count += 1
+                    icon = "🔴"; critical_count += 1
                 elif conf >= 85:
                     icon = "🟠"
                 elif conf >= 75:
                     icon = "🟡"
                 else:
                     icon = "⚪"
-                
                 lines.append(f"{icon} **{f['type']}** ({conf}%)\n  `{val_preview}`")
-            
             fields.append({
                 "name":   f"📄 {js_url.split('/')[-1][:60]}",
                 "value":  '\n'.join(lines)[:1024],
                 "inline": False
             })
-
-        total_files = len(by_url)
         total_secrets = len(findings)
-
-        if critical_count > 0:
-            color = 0xff0000
-            emoji = "🚨"
-        elif total_secrets > 0:
-            color = 0xff9900
-            emoji = "⚠️"
-        else:
-            color = 0xffff00
-            emoji = "ℹ️"
-
+        color = 0xff0000 if critical_count > 0 else (0xff9900 if total_secrets > 0 else 0xffff00)
+        emoji = "🚨" if critical_count > 0 else ("⚠️" if total_secrets > 0 else "ℹ️")
         embed = {
             "title":       f"{emoji} 🔑 SECRETS JS DETECTÉS — {domain}",
             "description": f"**{total_secrets}** secret(s) VRAI(S) | **{critical_count}** CRITIQUE(S)",
-            "color":       color,
-            "fields":      fields,
-            "footer":      {"text": "CT Monitor v4.3.2 — ZERO FALSE POSITIVES"},
+            "color":       color, "fields": fields,
+            "footer":      {"text": "CT Monitor v4.4.0 — ZERO FALSE POSITIVES"},
             "timestamp":   datetime.utcnow().isoformat()
         }
         discord_send({"embeds": [embed]})
-        tprint(f"[JS ALERT] {emoji} {domain} — {total_secrets} SECRET(S) RÉEL(S) ({critical_count} critique(s)) → Discord")
+        tprint(f"[JS ALERT] {emoji} {domain} — {total_secrets} SECRET(S) ({critical_count} critique(s)) → Discord")
 
-    def scan_all_sequential(self):
+    def scan_all_parallel(self):
+        """
+        ✅ NOUVEAU: Scan JS entièrement parallélisé via JS_WORKER_POOL.
+        Remplace scan_all_sequential() — même API externe.
+        """
         tprint("[JS SCAN] ════════════════════════════════════════")
-        tprint("[JS SCAN] Démarrage scan secrets JS (ULTRA-STRICT, ZERO FALSE POSITIVES v4.3.2)")
+        tprint(f"[JS SCAN] Démarrage scan secrets JS PARALLÈLE ({JS_SCAN_WORKERS} workers, v4.4.0)")
 
-        total_domains = total_files = total_secrets = 0
-        start = time.time()
+        start         = time.time()
+        total_domains = 0
+        futures_map   = {}
 
+        # Collecter tous les domaines en ligne et soumettre au pool JS
         for domain in db.iter_online_domains(page_size=100):
             total_domains += 1
-            tprint(f"[JS SCAN] [{total_domains}] Scan: {domain}")
+            future              = JS_WORKER_POOL.submit(self.scan_domain, domain)
+            futures_map[future] = domain
 
+        tprint(f"[JS SCAN] {total_domains} domaines soumis au pool ({JS_SCAN_WORKERS} workers)")
+
+        # Collecter les résultats au fil de l'eau
+        alerts_sent = 0
+        for future in as_completed(futures_map):
+            domain = futures_map[future]
             try:
-                findings = self.scan_domain(domain)
+                findings = future.result(timeout=JS_SCAN_TIMEOUT * MAX_JS_PER_DOMAIN + 30)
                 with stats_lock:
-                    total_files = stats['js_files_scanned']
-                    total_secrets = stats['js_secrets_found']
-
+                    stats['js_domains_scanned'] += 1
                 if findings:
                     self.send_js_alert(domain, findings)
-
+                    alerts_sent += 1
             except Exception as e:
                 tprint(f"[JS SCAN] Erreur domaine {domain}: {str(e)[:80]}")
-                traceback.print_exc()
-
-            time.sleep(0.5)
 
         elapsed = int(time.time() - start)
+        with stats_lock:
+            total_files   = stats['js_files_scanned']
+            total_secrets = stats['js_secrets_found']
         tprint(f"[JS SCAN] ════════════════════════════════════════")
         tprint(f"[JS SCAN] Terminé — {total_domains} domaine(s) | {total_files} JS | {elapsed}s")
+        tprint(f"[JS SCAN] Alertes envoyées: {alerts_sent}")
         if total_secrets > 0:
             tprint(f"[JS SCAN] 🚨 {total_secrets} SECRET(S) RÉEL(S) trouvé(s) au total !")
         else:
@@ -1830,6 +1772,10 @@ class JSScanner:
 
         with stats_lock:
             stats['last_js_scan'] = datetime.utcnow()
+
+    # Alias rétro-compat
+    def scan_all_sequential(self):
+        self.scan_all_parallel()
 
 js_scanner = JSScanner()
 
@@ -1852,10 +1798,10 @@ def load_subdomains_from_file():
                 duplicates += 1
                 continue
             tprint(f"[LOAD] 🔍 Check initial: {subdomain} ...")
-            check_result = check_domain(subdomain)
+            check_result  = check_domain(subdomain)
+            status_code   = None
+            response_time = None
             if check_result is None:
-                status_code = None
-                response_time = None
                 tprint(f"[LOAD] ⚠️ Échec total après retries pour {subdomain}")
             else:
                 status_code, response_time = check_result
@@ -1867,7 +1813,7 @@ def load_subdomains_from_file():
             loaded += 1
             status_str = str(status_code) if status_code else "timeout"
             tprint(f"[LOAD] {'✅' if status_code == 200 else '🔴'} {subdomain} [{status_str}]")
-        tprint(f"[LOAD] Résumé: {loaded} ajoutés | {duplicates} déjà en DB")
+        tprint(f"[LOAD] Résumé: {loaded} ajouté(s), {duplicates} déjà en DB")
         return loaded, duplicates
     except Exception as e:
         tprint(f"[ERROR] Chargement subdomains: {e}")
@@ -1879,7 +1825,7 @@ def send_discovery_alert(matched_domains_with_status, log_name):
         if not matched_domains_with_status:
             return
         filtered = []
-        skipped = 0
+        skipped  = 0
         for domain, status_code in matched_domains_with_status:
             if notif_cache.already_notified(domain, log_name):
                 skipped += 1
@@ -1899,8 +1845,8 @@ def send_discovery_alert(matched_domains_with_status, log_name):
                     by_base[base]['accessible'].append((domain, status_code))
                 else:
                     by_base[base]['unreachable'].append((domain, status_code))
-        description = ""
-        total_accessible = total_unreachable = 0
+        description       = ""
+        total_accessible  = total_unreachable = 0
         for base, data in sorted(by_base.items()):
             description += f"\n**{base}**\n"
             if data['accessible']:
@@ -1955,7 +1901,7 @@ def parse_certificate(entry):
         if len(leaf_bytes) < 12:
             return []
         log_entry_type = int.from_bytes(leaf_bytes[10:12], 'big')
-        cert_der = None
+        cert_der  = None
         cert_hash = _cert_hash(leaf_input)
         if log_entry_type == 0:
             with stats_lock:
@@ -1963,14 +1909,14 @@ def parse_certificate(entry):
             if len(leaf_bytes) < 15:
                 return []
             cert_length = int.from_bytes(leaf_bytes[12:15], 'big')
-            cert_end = 15 + cert_length
+            cert_end    = 15 + cert_length
             if cert_end <= len(leaf_bytes):
                 cert_der = leaf_bytes[15:cert_end]
         elif log_entry_type == 1:
             with stats_lock:
                 stats['precert_count'] += 1
             try:
-                extra_data = base64.b64decode(entry.get('extra_data', ''))
+                extra_data  = base64.b64decode(entry.get('extra_data', ''))
                 if len(extra_data) > 3:
                     cert_length = int.from_bytes(extra_data[0:3], 'big')
                     if len(extra_data) >= 3 + cert_length:
@@ -1981,7 +1927,7 @@ def parse_certificate(entry):
             with stats_lock:
                 stats['parse_errors'] += 1
             return []
-        cert = x509.load_der_x509_certificate(cert_der, default_backend())
+        cert        = x509.load_der_x509_certificate(cert_der, default_backend())
         all_domains = set()
         try:
             cn = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
@@ -1990,7 +1936,7 @@ def parse_certificate(entry):
         except Exception:
             pass
         try:
-            san_ext = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+            san_ext  = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
             san_list = list(san_ext.value)
             if len(san_list) > MAX_SANS_PER_CERT:
                 db.log_anomaly(cert_hash, "excessive_sans", f"{len(san_list)} SANs")
@@ -2013,61 +1959,85 @@ def parse_certificate(entry):
             stats['parse_errors'] += 1
         return []
 
-# ==================== CRON JOB - RECHECK + JS SCAN ====================
+# ==================== CRON JOB ====================
 _path_scan_running = threading.Event()
-_js_scan_running = threading.Event()
+_js_scan_running   = threading.Event()
+
+def _recheck_single_domain(domain_row: tuple) -> tuple:
+    """
+    ✅ NOUVEAU: Worker pour recheck d'un seul domaine offline.
+    Retourne (domain, status_code, response_time, back_online).
+    """
+    domain, base_domain, last_check = domain_row
+    host, port = parse_subdomain_entry(domain)
+    check_result = check_domain(host)
+    status_code = response_time = None
+    if check_result is None:
+        tprint(f"[CRON] ⚠️ Échec total check {domain}")
+    else:
+        status_code, response_time = check_result
+
+    port_status = ""
+    if port:
+        port_open, _ = check_port(host, port)
+        port_status   = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
+        if port_open and (status_code is None or status_code >= 400):
+            status_code = 200
+
+    back_online = status_code == 200
+    return (domain, status_code, response_time, back_online, port_status)
 
 def cron_recheck_unreachable():
-    tprint("[CRON] Thread recheck + JS scan démarré")
-    RECHECK_BATCH = 100
-    last_js_scan_time = 0
+    """
+    ✅ REFACTORISÉ: Recheck offline en parallèle (ThreadPoolExecutor dédié).
+    Les writes DB passent tous par le DatabaseWriter.
+    """
+    tprint("[CRON] Thread recheck + JS scan démarré (PARALLEL v4.4.0)")
+    RECHECK_BATCH      = 200   # ✅ AUGMENTÉ: on peut se le permettre en parallèle
+    RECHECK_WORKERS    = 30    # ✅ NOUVEAU: workers dédiés recheck
+    last_js_scan_time  = 0
 
     while True:
         try:
             total_offline = db.count_offline()
-            total = db.count()
+            total         = db.count()
             tprint(f"[CRON] ---- Recheck — {total} domaine(s) | {total_offline} offline ----")
             back_online = still_down = 0
 
             if total_offline > 0:
+                # ✅ PARALLÈLE: collecter toutes les rows offline puis les checker en //
                 offset = 0
                 while True:
-                    domains = db.get_offline(limit=RECHECK_BATCH, offset=offset)
-                    if not domains:
+                    domain_rows = db.get_offline(limit=RECHECK_BATCH, offset=offset)
+                    if not domain_rows:
                         break
-                    for domain, base_domain, last_check in domains:
-                        host, port = parse_subdomain_entry(domain)
-                        check_result = check_domain(host)
-                        if check_result is None:
-                            status_code = None
-                            response_time = None
-                            tprint(f"[CRON] ⚠️ Échec total check {domain}")
-                        else:
-                            status_code, response_time = check_result
 
-                        port_status = ""
-                        if port:
-                            port_open, _ = check_port(host, port)
-                            port_status = f" | port {port}: {'ouvert' if port_open else 'fermé'}"
-                            if port_open and (status_code is None or status_code >= 400):
-                                status_code = 200
-
-                        if status_code == 200:
-                            tprint(f"[CRON] ✅ {domain} [{status_code}]{port_status} — redevenu accessible!")
-                            send_now_accessible_alert(domain)
-                            db.mark_online(domain, status_code)
-                            back_online += 1
-                        else:
-                            db.update_check(domain, status_code, response_time)
-                            tprint(f"[CRON] 🔴 {domain} [{status_code or 'timeout'}]{port_status}")
-                            still_down += 1
+                    with ThreadPoolExecutor(max_workers=RECHECK_WORKERS, thread_name_prefix="Recheck") as ex:
+                        futures = {ex.submit(_recheck_single_domain, row): row for row in domain_rows}
+                        for future in as_completed(futures):
+                            try:
+                                domain, status_code, response_time, is_back, port_status = future.result(timeout=HTTP_CHECK_TIMEOUT + 5)
+                                if is_back:
+                                    tprint(f"[CRON] ✅ {domain} [{status_code}]{port_status} — redevenu accessible!")
+                                    send_now_accessible_alert(domain)
+                                    db.mark_online(domain, status_code)
+                                    back_online += 1
+                                else:
+                                    db.update_check(domain, status_code, response_time)
+                                    tprint(f"[CRON] 🔴 {domain} [{status_code or 'timeout'}]{port_status}")
+                                    still_down += 1
+                            except Exception as e:
+                                tprint(f"[CRON] Erreur recheck: {str(e)[:80]}")
                     offset += RECHECK_BATCH
             else:
                 tprint("[CRON] Aucun domaine offline à recheck")
 
             tprint(f"[CRON] {back_online} redevenu(s) en ligne | {still_down} toujours hors ligne")
 
+            # Purge historique (async via writer)
             db.purge_history(retention_days=CHECK_HISTORY_RETENTION_DAYS)
+
+            # VACUUM périodique
             with stats_lock:
                 last_vac = stats['last_vacuum']
             if (datetime.utcnow() - last_vac).days >= VACUUM_INTERVAL_DAYS:
@@ -2097,11 +2067,11 @@ def cron_recheck_unreachable():
                 def _run_js_scan():
                     _js_scan_running.set()
                     try:
-                        js_scanner.scan_all_sequential()
+                        js_scanner.scan_all_parallel()
                     finally:
                         _js_scan_running.clear()
                 threading.Thread(target=_run_js_scan, daemon=True, name="JSScan").start()
-                tprint(f"[CRON] Scan JS lancé (intervalle: {JS_SCAN_INTERVAL}s)")
+                tprint(f"[CRON] Scan JS parallèle lancé (workers: {JS_SCAN_WORKERS})")
             else:
                 next_scan = int(JS_SCAN_INTERVAL - (now - last_js_scan_time))
                 tprint(f"[CRON] Prochain scan JS dans {next_scan}s")
@@ -2117,17 +2087,19 @@ def cron_recheck_unreachable():
 # ==================== CT MONITORING ====================
 def monitor_log(log_config):
     log_name = log_config['name']
-    log_url = log_config['url']
+    log_url  = log_config['url']
     priority = log_config.get('priority', 'MEDIUM')
-    cb = get_circuit_breaker(log_name)
+    cb       = get_circuit_breaker(log_name)
+
     if not cb.is_available():
         tprint(f"[{log_name}] ⚠️ Circuit breaker OPEN — skipped")
         with stats_lock:
             stats['circuit_breaker_trips'] += 1
         return 0
+
     if log_name not in stats['positions']:
         try:
-            response = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
+            response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
             tree_size = response.json()['tree_size']
             with stats_lock:
                 stats['positions'][log_name] = max(0, tree_size - 1000)
@@ -2137,24 +2109,29 @@ def monitor_log(log_config):
             cb.record_failure()
             tprint(f"[{log_name}] Erreur init: {str(e)[:80]}")
             return 0
+
     try:
-        response = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
+        response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
         tree_size = response.json()['tree_size']
         cb.record_success()
     except Exception as e:
         cb.record_failure()
         tprint(f"[{log_name}] Erreur get-sth: {str(e)[:80]}")
         return 0
+
     with stats_lock:
         current_pos = stats['positions'][log_name]
     if current_pos >= tree_size:
         return 0
-    backlog = tree_size - current_pos
+
+    backlog    = tree_size - current_pos
     max_batches = {'CRITICAL': MAX_BATCHES_CRITICAL, 'HIGH': MAX_BATCHES_HIGH}.get(priority, MAX_BATCHES_MEDIUM)
     tprint(f"[{log_name}] Backlog: {backlog:,} — max {max_batches * BATCH_SIZE:,} certs ce cycle")
-    batches_done = 0
-    all_results = []
+
+    batches_done  = 0
+    all_results   = []
     pending_http: dict[Future, str] = {}
+
     while batches_done < max_batches:
         with stats_lock:
             current_pos = stats['positions'][log_name]
@@ -2172,11 +2149,12 @@ def monitor_log(log_config):
             break
         if not entries:
             break
+
         for entry in entries:
             with stats_lock:
                 stats['certificats_analysés'] += 1
             leaf_input = entry.get('leaf_input', '')
-            cert_hash = _cert_hash(leaf_input)
+            cert_hash  = _cert_hash(leaf_input)
             if seen_certificates.contains(cert_hash):
                 with stats_lock:
                     stats['duplicates_évités'] += 1
@@ -2195,28 +2173,31 @@ def monitor_log(log_config):
                     for future in list(pending_http.keys())[:100]:
                         try:
                             status_code, response_time = future.result(timeout=2)
-                            all_results.append((domain, status_code))
+                            all_results.append((pending_http[future], status_code))
                         except Exception:
                             pass
                         del pending_http[future]
-                future = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
+                future              = HTTP_WORKER_POOL.submit(_do_check_domain, domain)
                 pending_http[future] = domain
+
         with stats_lock:
             stats['positions'][log_name] = end_pos
-            stats['batches_processed'] += 1
+            stats['batches_processed']  += 1
         batches_done += 1
+
     for future in as_completed(pending_http, timeout=HTTP_CHECK_TIMEOUT + 5):
         domain = pending_http[future]
         try:
             status_code, response_time = future.result()
         except Exception:
-            status_code, response_time = None, None
+            status_code = response_time = None
         with stats_lock:
             stats['http_checks'] += 1
         all_results.append((domain, status_code))
         base = next((t for t in targets if domain == t or domain.endswith('.' + t)), None)
         if base:
             db.add_domain(domain, base, status_code, log_name)
+
     if all_results:
         send_discovery_alert(all_results, log_name)
     return batches_done
@@ -2237,13 +2218,13 @@ def monitor_all_logs():
 # ==================== NETTOYAGE DB ====================
 def cleanup_db():
     try:
-        conn = db.get_conn()
+        conn   = db.get_conn()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
         wildcards_deleted = cursor.rowcount
         if targets:
             conditions = []
-            params = []
+            params     = []
             for t in targets:
                 conditions.append("domain = ? OR domain LIKE ?")
                 params.extend([t, f'%.{t}'])
@@ -2267,7 +2248,7 @@ def dump_db():
     tprint("[DUMP] Envoi du contenu de la DB sur Discord...")
     PAGE_SIZE = 100
     try:
-        conn = db.get_conn()
+        conn   = db.get_conn()
         cursor = conn.cursor()
         summary = db.stats_summary()
         requests.post(DISCORD_WEBHOOK, json={"embeds": [{
@@ -2284,19 +2265,16 @@ def dump_db():
         cursor.execute('SELECT domain, status_code, log_source, last_check FROM subdomains ORDER BY last_check DESC')
         total_sent = 0
         chunk_size = 20
-        buffer = []
+        buffer     = []
         while True:
             rows = cursor.fetchmany(PAGE_SIZE)
             if not rows:
                 break
             buffer.extend(rows)
             while len(buffer) >= chunk_size:
-                chunk = buffer[:chunk_size]
+                chunk  = buffer[:chunk_size]
                 buffer = buffer[chunk_size:]
-                lines = [
-                    f"`{d}` [{s or 'timeout'}] — {(lc or '')[:16]}"
-                    for d, s, _, lc in chunk
-                ]
+                lines  = [f"`{d}` [{s or 'timeout'}] — {(lc or '')[:16]}" for d, s, _, lc in chunk]
                 total_sent += len(chunk)
                 requests.post(DISCORD_WEBHOOK, json={"embeds": [{
                     "title":       f"Domaines {total_sent - len(chunk) + 1}–{total_sent}",
@@ -2334,10 +2312,10 @@ if os.environ.get('DUMP_DB', '0') == '1':
 
 # ==================== DÉMARRAGE ====================
 tprint("[START] ================================================")
-tprint(f"[START] CT Monitor v4.3.2 - COMPLETE FIXED (ZERO FALSE POSITIVES)")
+tprint(f"[START] CT Monitor v4.4.0 - PARALLEL EDITION")
 tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s) surveillés")
-tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | JS patterns: {len(JS_SECRET_COMPILED)} ULTRA-STRICT")
-tprint(f"[START] JS scanner v4.3.2: Format validation + Contexte 500ch + Confiance intelligente")
+tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | JS pool: {JS_SCAN_WORKERS} workers")
+tprint(f"[START] DB Writer: queue={DB_WRITE_QUEUE_SIZE} | flush toutes les {int(DB_WRITE_BATCH_TIMEOUT*1000)}ms")
 tprint(f"[START] JS scan interval: {JS_SCAN_INTERVAL}s | Confidence threshold: 75% MINIMUM")
 tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History: {CHECK_HISTORY_RETENTION_DAYS}j")
 tprint("[START] ================================================")
@@ -2367,48 +2345,59 @@ while True:
     try:
         cycle += 1
         cycle_start = time.time()
+
         if cycle % TARGETS_RELOAD_INTERVAL == 0:
             tprint(f"[CYCLE #{cycle}] Reloading targets...")
             new_targets = load_targets()
             if len(new_targets) != len(targets):
                 tprint(f"[CYCLE #{cycle}] Targets changed: {len(targets)} → {len(new_targets)}")
                 targets = new_targets
+
         with stats_lock:
             stats['dernière_vérification'] = datetime.utcnow()
+
         tprint(f"[CYCLE #{cycle}] ---- {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} ----")
         cycle_reset()
         update_heartbeat()
         monitor_all_logs()
         save_positions()
+
         cleared = notif_cache.clear_expired()
         if cleared > 0:
             tprint(f"[CYCLE #{cycle}] Notif cache: {cleared} expirée(s)")
+
         cycle_duration = int(time.time() - cycle_start)
         _s = db.stats_summary()
+
         certs_this_cycle = stats['certificats_analysés']
         if certs_this_cycle < MIN_CERTS_PER_CYCLE:
             tprint(f"[ALERT] ⚠️ Seulement {certs_this_cycle} certs ce cycle (min: {MIN_CERTS_PER_CYCLE})")
+
         tprint(f"[CYCLE #{cycle}] Terminé en {cycle_duration}s")
-        tprint(f"[CYCLE #{cycle}] Certificats analysés : {stats['certificats_analysés']:,}")
-        tprint(f"[CYCLE #{cycle}] Matches trouvés      : {stats['matches_trouvés']:,}")
-        tprint(f"[CYCLE #{cycle}] HTTP checks           : {stats['http_checks']:,}")
-        tprint(f"[CYCLE #{cycle}] Alertes envoyées      : {stats['alertes_envoyées']:,}")
-        tprint(f"[CYCLE #{cycle}] Duplicates évités     : {stats['duplicates_évités']:,}")
-        tprint(f"[CYCLE #{cycle}] Echo-servers bloqués  : {stats['echo_server_blocked']:,}")
-        tprint(f"[CYCLE #{cycle}] JS fichiers scannés   : {stats['js_files_scanned']:,}")
-        tprint(f"[CYCLE #{cycle}] JS SECRETS VRAIS      : {stats['js_secrets_found']:,}")
-        tprint(f"[CYCLE #{cycle}] JS FALSE POSITIVES    : {stats['js_false_positives']:,}")  # ✅ NOUVEAU
-        tprint(f"[CYCLE #{cycle}] Discord queue         : {_discord_queue.qsize()} | perdus: {stats['discord_dropped']}")
+        tprint(f"[CYCLE #{cycle}] Certificats analysés  : {stats['certificats_analysés']:,}")
+        tprint(f"[CYCLE #{cycle}] Matches trouvés        : {stats['matches_trouvés']:,}")
+        tprint(f"[CYCLE #{cycle}] HTTP checks            : {stats['http_checks']:,}")
+        tprint(f"[CYCLE #{cycle}] Alertes envoyées       : {stats['alertes_envoyées']:,}")
+        tprint(f"[CYCLE #{cycle}] Duplicates évités      : {stats['duplicates_évités']:,}")
+        tprint(f"[CYCLE #{cycle}] Echo-servers bloqués   : {stats['echo_server_blocked']:,}")
+        tprint(f"[CYCLE #{cycle}] JS fichiers scannés    : {stats['js_files_scanned']:,}")
+        tprint(f"[CYCLE #{cycle}] JS SECRETS VRAIS       : {stats['js_secrets_found']:,}")
+        tprint(f"[CYCLE #{cycle}] JS FALSE POSITIVES     : {stats['js_false_positives']:,}")
+        tprint(f"[CYCLE #{cycle}] DB Writer queue        : {stats['db_write_queue_size']} | écrits: {stats['db_writes_processed']:,}")
+        tprint(f"[CYCLE #{cycle}] Discord queue          : {_discord_queue.qsize()} | perdus: {stats['discord_dropped']}")
         tprint(f"[CYCLE #{cycle}] DB : {_s['total']} domaines | {db.size_mb()} MB")
         tprint(f"[CYCLE #{cycle}] DB : {_s['timeout']} timeout | {_s['4xx']} 4xx | {_s['5xx']} 5xx")
         tprint(f"[CYCLE #{cycle}] Prochain cycle dans {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
+
     except KeyboardInterrupt:
         tprint("[STOP] Arrêt demandé")
         save_positions()
+        db._writer.stop()
         _discord_queue.put(None)
         _discord_thread.join(timeout=5)
         HTTP_WORKER_POOL.shutdown(wait=False)
+        JS_WORKER_POOL.shutdown(wait=False)
         cleanup_sessions()
         break
     except Exception as e:
