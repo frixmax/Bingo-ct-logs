@@ -1392,8 +1392,9 @@ JS_SECRET_PATTERNS_RAW = {
     'Discord Bot Token':      r'\b[MN][A-Za-z0-9_\-]{23,25}\.[A-Za-z0-9_\-]{6,8}\.[A-Za-z0-9_\-]{25,38}\b',
     'Telegram Bot Token':     r'\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b',
     'Stripe Webhook Secret':  r'\bwhsec_[A-Za-z0-9_\-]{32,}\b',
-    # Heroku: UUID format MAIS filtré par blocklist dans _is_allowlisted_value
-    'Heroku API Key':         r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
+    # Heroku: UUID AVEC contexte obligatoire (variable heroku/api autour)
+    # Sans contexte = UUID générique (session ID, tracking ID, config ID...)
+    'Heroku API Key':         r'(?:heroku[_\-]?(?:api[_\-]?)?(?:key|token)|HEROKU[_\-]API[_\-]KEY)\s*[=:]\s*["\']?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})["\']?',
     'DigitalOcean Token':     r'\bdop_v1_[a-f0-9]{64}\b',
     # CircleCI: contexte obligatoire (variable assignment autour)
     'CircleCI Token':         r'(?:CIRCLE_TOKEN|circleci[_\-]token|circle[_\-]api[_\-]key)\s*[=:]\s*["\']?([a-f0-9]{40})["\']?',
