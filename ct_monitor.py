@@ -2203,7 +2203,7 @@ def monitor_log(log_config):
             stats['circuit_breaker_trips'] += 1
         return 0
 
-   if log_name not in stats['positions']:
+    if log_name not in stats['positions']:
         try:
             response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
             tree_size = response.json()['tree_size']
