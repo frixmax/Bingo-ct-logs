@@ -10,4 +10,6 @@ assurancewireless.com
 uscc.com
 uscc.net
 uscellular.com
-vistarmedia.com
+api.t-mobile.com
+api.vistarmedia.com
+api.vistarmedia.eu
