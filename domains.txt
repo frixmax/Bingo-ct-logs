@@ -1,7 +1,1 @@
-vodafone.com
-vodacom.co.za
-vodafone.ro
-vodafone.it
-vodafone.cz
-vodafone.de
-vodafone.es
+
