@@ -2203,12 +2203,17 @@ def monitor_log(log_config):
             stats['circuit_breaker_trips'] += 1
         return 0
 
-    if log_name not in stats['positions']:
+   if log_name not in stats['positions']:
         try:
             response  = requests.get(f"{log_url}/ct/v1/get-sth", timeout=10)
             tree_size = response.json()['tree_size']
             with stats_lock:
-                stats['positions'][log_name] = max(0, tree_size - 1000)
+                lookback = {
+                    'CRITICAL': 500000,
+                    'HIGH':     200000,
+                    'MEDIUM':   50000,
+                }.get(priority, 10000)
+                stats['positions'][log_name] = max(0, tree_size - lookback)
             cb.record_success()
             tprint(f"[INIT] {log_name}: position initiale {stats['positions'][log_name]:,}")
         except Exception as e:
