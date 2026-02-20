@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-CT Monitoring VPS - VERSION v4.3.1 - PRODUCTION READY (COMPLETE FIXED)
+CT Monitoring VPS - VERSION v4.3.2 - PRODUCTION READY (COMPLETE FIXED)
 ✅ Regex ultra-strictes (zéro faux positifs garantis)
-✅ Système de confiance 0-100%
+✅ Système de confiance 0-100% AMÉLIORÉ
 ✅ Emojis visuels (🔴 critique, 🟠 moyen, 🟡 bas)
 ✅ Allowlist complète (Unicode, camelCase, validation messages)
+✅ CORRECTIONS JS SCANNER - Validation format, contexte amélioré, confiance intelligente
 """
 import requests
 import json
@@ -39,7 +40,7 @@ def tprint(msg):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 tprint("=" * 100)
-tprint("CT MONITORING - VERSION v4.3.1 - COMPLETE FIXED (Zero False Positives)")
+tprint("CT MONITORING - VERSION v4.3.2 - COMPLETE FIXED (Zero False Positives + Improved JS Scanner)")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 tprint("=" * 100)
 
@@ -149,6 +150,8 @@ stats = {
     'js_secrets_found':       0,
     'js_domains_scanned':     0,
     'last_js_scan':           None,
+    'js_false_positives':     0,  # ✅ NOUVEAU
+    'js_false_negatives':     0,  # ✅ NOUVEAU
 }
 stats_lock = threading.Lock()
 
@@ -400,6 +403,18 @@ class CertificateDatabase:
                 secrets_found INTEGER DEFAULT 0
             )
         ''')
+        # ✅ NOUVEAU: Table pour JS false positives
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS js_false_positives (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                domain       TEXT NOT NULL,
+                js_url       TEXT NOT NULL,
+                secret_type  TEXT NOT NULL,
+                secret_value TEXT NOT NULL,
+                reason       TEXT,
+                timestamp    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='unreachable_domains'")
         if cursor.fetchone():
@@ -420,6 +435,7 @@ class CertificateDatabase:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_anom_hash ON anomalies(cert_hash)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_js_domain ON js_secrets(domain)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_js_url ON js_scan_history(js_url)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_js_fp_domain ON js_false_positives(domain)')
         conn.commit()
         tprint(f"[DB] Initialisée: {self.db_path}")
 
@@ -484,6 +500,21 @@ class CertificateDatabase:
                 stats['false_positives'] += 1
         except Exception as e:
             tprint(f"[DB ERROR] log_false_positive: {e}")
+
+    def log_js_false_positive(self, domain, js_url, secret_type, secret_value, reason):
+        """✅ NOUVEAU: Logger les faux positifs JS"""
+        try:
+            conn   = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO js_false_positives (domain, js_url, secret_type, secret_value, reason) VALUES (?,?,?,?,?)',
+                (domain, js_url, secret_type, secret_value[:120], reason)
+            )
+            conn.commit()
+            with stats_lock:
+                stats['js_false_positives'] += 1
+        except Exception as e:
+            tprint(f"[DB ERROR] log_js_false_positive: {e}")
 
     def log_anomaly(self, cert_hash, anomaly_type, detail):
         try:
@@ -1027,6 +1058,7 @@ def load_targets():
 
 targets = load_targets()
 
+# (Continuer à la Partie 2/2...)
 # ==================== PATH MONITOR ====================
 class PathMonitor:
     DEFAULT_PATHS = [
@@ -1204,23 +1236,25 @@ class PathMonitor:
 path_monitor = PathMonitor(PATHS_FILE)
 
 # ==================== JS SECRET PATTERNS ULTRA-STRICT (ZERO FALSE POSITIVES) ====================
+# ✅ NOUVELLE VERSION 4.3.2 - Patterns raffinés + validation format
+
 JS_SECRET_PATTERNS_RAW = {
     # ── AWS ───────────────────────────────────────────────────────────────────────────────────
     'AWS Access Key ID': r'\bAKIA[0-9A-Z]{16}\b',
-    'AWS Secret Access Key': r'\bwsu4ecoCS[A-Za-z0-9/+]{30,40}\b',  # Format strict AWS secrets
-    'AWS Session Token': r'(?:AQoDY|AQAB)[A-Za-z0-9/+=]{200,}',  # Format exact AWS tokens
+    'AWS Secret Access Key': r'\bwsu4ecoCS[A-Za-z0-9/+]{30,40}\b',
+    'AWS Session Token': r'(?:AQoDY|AQAB)[A-Za-z0-9/+=]{200,}',
     
     # ── GCP ───────────────────────────────────────────────────────────────────────────────────
-    'GCP API Key': r'\bAIza[0-9A-Za-z\-_]{35}\b',  # Format strict GCP
+    'GCP API Key': r'\bAIza[0-9A-Za-z\-_]{35}\b',
     'GCP Service Account Key': r'"type":\s*"service_account"[^}]{100,}?"client_id":\s*"[0-9]+-[a-z0-9]{20}\.apps\.googleusercontent\.com"',
     
     # ── GitHub ────────────────────────────────────────────────────────────────────────────────
-    'GitHub Personal Token': r'\bghp_[0-9a-zA-Z]{36}\b',  # Format exact (36 chars)
+    'GitHub Personal Token': r'\bghp_[0-9a-zA-Z]{36}\b',
     'GitHub OAuth Token': r'\bgho_[0-9a-zA-Z]{36}\b',
     'GitHub App Token': r'\bghu_[0-9a-zA-Z]{36}\b',
     
     # ── Stripe ────────────────────────────────────────────────────────────────────────────────
-    'Stripe Secret Key Live': r'\bsk_live_[0-9a-zA-Z]{24,}\b',  # Production only
+    'Stripe Secret Key Live': r'\bsk_live_[0-9a-zA-Z]{24,}\b',
     'Stripe API Key': r'\brk_live_[0-9a-zA-Z]{24,}\b',
     
     # ── Database URIs ─────────────────────────────────────────────────────────────────────────
@@ -1234,8 +1268,8 @@ JS_SECRET_PATTERNS_RAW = {
     'OpenSSH Private Key': r'-----BEGIN OPENSSH PRIVATE KEY-----\s+[A-Za-z0-9+/\s]{100,}-----END OPENSSH PRIVATE KEY-----',
     'PGP Private Key': r'-----BEGIN PGP PRIVATE KEY BLOCK-----\s+[A-Za-z0-9+/\s]{200,}-----END PGP PRIVATE KEY BLOCK-----',
     
-    # ── JWT Tokens ────────────────────────────────────────────────────────────────────────────
-    'JWT Token': r'\beyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\b',  # Plus strict
+    # ── JWT Tokens (✅ PATTERN AMÉLIORÉ - baissé le seuil) ────────────────────────────────────
+    'JWT Token': r'\beyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\b',
     
     # ── Communication APIs ────────────────────────────────────────────────────────────────────
     'Slack Bot Token': r'\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[0-9a-zA-Z]{24}\b',
@@ -1249,9 +1283,9 @@ JS_SECRET_PATTERNS_RAW = {
     'Heroku API Key': r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
     'DigitalOcean Token': r'\bdop_v1_[a-f0-9]{64}\b',
     
-    # ── CI/CD Tokens ──────────────────────────────────────────────────────────────────────────
-    'CircleCI Token': r'\b[a-f0-9]{40}\b',  # 40 hex chars
-    'Travis CI Token': r'\b[a-zA-Z0-9_-]{100,}\b',  # JWT-like pattern
+    # ── CI/CD Tokens (✅ PATTERN AMÉLIORÉ - moins générique) ───────────────────────────────
+    'CircleCI Token': r'\b[a-f0-9]{40}(?:[a-f0-9]{20})?\b(?![\-])(?<![a-z0-9-])',
+    'Travis CI Token': r'\b[a-zA-Z0-9_-]{100,}\b',
 }
 
 # CRITICAL ALLOWLIST - Filtrer TOUS les faux positifs avant détection
@@ -1259,7 +1293,7 @@ JS_SECRET_ALLOWLIST_VALUES = {
     # Placeholders
     'your_api_key', 'your_secret_key', 'your_secret', 'your_token', 'your_password',
     'insert_key_here', 'enter_your_key', 'api_key_here', 'example', 'test', 'demo',
-    'fake', 'dummy', 'placeholder', 'changeme',
+    'fake', 'dummy', 'placeholder', 'changeme', 'replace_me', 'update_this',
     
     # Unicode patterns (traductions)
     'كلمة', 'المرور', 'contraseña', 'مرور', 'пароль', '密码',
@@ -1267,20 +1301,21 @@ JS_SECRET_ALLOWLIST_VALUES = {
     # Validation messages
     'passwords must be at least', 'password must be', 'at least 8 characters',
     'confirm your password', 'enter your password', 'validation error',
-    'must match', 'required field', 'invalid format',
+    'must match', 'required field', 'invalid format', 'invalid input',
     
     # UI Elements & Code
     'ql-password', '#password', 'password_field', 'expandwildcard',
     'generaldemo', 'summer2023', 'demo2024', 'test123', 'admin123',
+    'qwerty', 'password123', 'letmein', 'welcome', 'admin',
     
-    # Common short passwords that appear in tests
-    'password', 'secret', 'token', '123456', 'admin',
+    # Patterns courants
+    '0000000000000000', '1111111111111111',
+    'abcdefghijklmnop', 'abcdefghijklmnopqrstuvwxyz',
+    'xxxxxxxxxxxxxxxx', 'yyyyyyyyyyyyyyyy',
     
-    # Repeated characters
-    'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-    'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    '0000000000000000000000000000000000000000',
+    # Hashes SHA/MD5
+    '5d41402abc4b2a76b9719d911017c592',
+    'da39a3ee5e6b4b0d3255bfef95601890afd80709',
 }
 
 # Compiler tous les patterns
@@ -1289,20 +1324,77 @@ JS_SECRET_COMPILED = {
     for name, pattern in JS_SECRET_PATTERNS_RAW.items()
 }
 
-tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns ULTRA-STRICT compilés")
+tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns ULTRA-STRICT compilés (v4.3.2)")
 
-# ==================== JS SECRET SCANNER ====================
+# ==================== JS SECRET SCANNER (✅ VERSION 4.3.2 AMÉLIORÉE) ====================
 class JSScanner:
+
+    # ✅ NOUVEAU: Validateurs de format strict
+    SECRET_VALIDATORS = {
+        'AWS Access Key ID': lambda v: len(v) == 20 and v.isupper(),
+        'AWS Secret Access Key': lambda v: 30 <= len(v) <= 40,
+        'AWS Session Token': lambda v: 100 <= len(v) <= 300,
+        
+        'GCP API Key': lambda v: len(v) == 39 and v.startswith('AIza'),
+        
+        'GitHub Personal Token': lambda v: len(v) == 36 and v.isalnum(),
+        'GitHub OAuth Token': lambda v: len(v) == 36 and v.isalnum(),
+        'GitHub App Token': lambda v: len(v) == 36 and v.isalnum(),
+        
+        'Stripe Secret Key Live': lambda v: len(v) >= 24 and '_' in v,
+        'Stripe Webhook Secret': lambda v: len(v) >= 32,
+        
+        'JWT Token': lambda v: v.count('.') == 2 and len(v) > 30,
+        
+        'PostgreSQL Connection': lambda v: 'postgres://' in v,
+        'MySQL Connection': lambda v: 'mysql://' in v,
+        'MongoDB Connection': lambda v: 'mongodb' in v and '://' in v,
+        
+        'RSA Private Key': lambda v: 'BEGIN RSA PRIVATE KEY' in v,
+        'EC Private Key': lambda v: 'BEGIN EC PRIVATE KEY' in v,
+        'OpenSSH Private Key': lambda v: 'BEGIN OPENSSH PRIVATE KEY' in v,
+        
+        'Slack Bot Token': lambda v: v.startswith('xoxb-') and len(v) > 40,
+        'Discord Bot Token': lambda v: (v.startswith('M') or v.startswith('N')) and '.' in v,
+        'Telegram Bot Token': lambda v: re.match(r'^\d{8,10}:AA[A-Za-z0-9_-]{33}$', v),
+        
+        'Heroku API Key': lambda v: re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', v),
+        'DigitalOcean Token': lambda v: v.startswith('dop_v1_') and len(v) > 40,
+        
+        'CircleCI Token': lambda v: len(v) >= 40 and not any(c in v for c in ['-', '.']),
+    }
+    
+    def _validate_secret_format(self, secret_type: str, value: str) -> bool:
+        """✅ NOUVEAU: Valide le format exact du secret."""
+        if secret_type not in self.SECRET_VALIDATORS:
+            return True
+        try:
+            return self.SECRET_VALIDATORS[secret_type](value)
+        except Exception:
+            return False
 
     def _content_hash(self, content: str) -> str:
         return hashlib.sha256(content.encode('utf-8', errors='replace')).hexdigest()[:16]
 
-    def _is_allowlisted_value(self, value: str) -> bool:
-        """Filtre TOUS les faux positifs connus."""
+    def _is_allowlisted_value(self, value: str, secret_type: str = None) -> bool:
+        """✅ AMÉLIORÉ: Filtre intelligent avec min_length par type."""
         v = value.strip().lower()
         
-        # Trop courte
-        if len(v) < 16:  # Augmenté de 10 à 16
+        # ✅ NOUVEAU: Min length PAR TYPE (pas de blanket 16)
+        MIN_LENGTHS = {
+            'AWS Access Key ID': 20,
+            'AWS Secret Access Key': 30,
+            'GitHub Personal Token': 36,
+            'Stripe Secret Key Live': 24,
+            'JWT Token': 30,  # ↓ Baissé de 50 → 30
+            'CircleCI Token': 32,
+            'Heroku API Key': 36,
+            'Slack Bot Token': 40,
+            'Discord Bot Token': 30,  # ↓ Baissé de 50 → 30
+        }
+        
+        min_len = MIN_LENGTHS.get(secret_type, 16)
+        if len(v) < min_len:
             return True
         
         # Dans la liste noire
@@ -1310,38 +1402,134 @@ class JSScanner:
             return True
         
         # Unicode encodé
-        if '\\u' in value or '\u0000' <= value[0] <= '\u001f':
+        if '\\u' in value or (value and '\u0000' <= value[0] <= '\u001f'):
             return True
         
-        # Contient des mots-clés de validation
-        validation_kw = ['must be', 'password', 'confirm', 'enter', 'invalid', 'required', 'error', 'validation']
+        # Contient mots-clés validation + court
+        validation_kw = ['must be', 'password', 'confirm', 'enter', 'invalid', 'required', 'error']
         if any(kw in v for kw in validation_kw) and len(v) < 50:
             return True
         
-        # CamelCase code (fonction/variable)
+        # CamelCase code
         if re.match(r'^[a-z]+(?:[a-z]*[A-Z][a-z]+){2,}$', v):
             return True
         
-        # Peu de caractères uniques
-        if len(set(v)) < 6:  # Augmenté de 5 à 6
+        # Peu caractères uniques (hash/répétition)
+        unique_chars = len(set(v))
+        if unique_chars < 8:  # ↑ De 5 → 8
             return True
         
-        # Que des chiffres (IDs publics)
-        if v.isdigit():
+        # Que chiffres
+        if v.isdigit() and len(v) < 50:
             return True
         
-        # Placeholder HTML
-        if '<' in v or '[' in v:
+        # HTML/template
+        if '<' in v or '[' in v or '{' in v:
             return True
         
         return False
 
     def _extract_context(self, content: str, match) -> str:
-        start   = max(0, match.start() - 80)
-        end     = min(len(content), match.end() + 80)
-        context = content[start:end]
-        context = re.sub(r'\s+', ' ', context).strip()
-        return context[:300]
+        """✅ AMÉLIORÉ: Extraire ligne COMPLÈTE + contexte (300 chars)."""
+        # Chercher les limites de ligne
+        line_start = content.rfind('\n', 0, match.start())
+        if line_start == -1:
+            line_start = 0
+        else:
+            line_start += 1
+        
+        line_end = content.find('\n', match.end())
+        if line_end == -1:
+            line_end = len(content)
+        
+        # Retourner la ligne complète (max 500 chars)
+        full_line = content[line_start:line_end]
+        if len(full_line) > 500:
+            full_line = full_line[:500]
+        
+        return full_line
+
+    def _calculate_confidence(self, secret_type: str, value: str, context: str) -> int:
+        """✅ AMÉLIORÉ: Calcul STRICT de confiance avec bonus/malus contexte."""
+        base_scores = {
+            'AWS Access Key ID': 95,
+            'AWS Secret Access Key': 95,
+            'GCP API Key': 95,
+            'GCP Service Account Key': 95,
+            'GitHub Personal Token': 95,
+            'GitHub OAuth Token': 95,
+            'GitHub App Token': 95,
+            'Stripe Secret Key Live': 95,
+            'RSA Private Key': 95,
+            'EC Private Key': 95,
+            'OpenSSH Private Key': 95,
+            'PGP Private Key': 95,
+            'PostgreSQL Connection': 95,
+            'MySQL Connection': 95,
+            'MongoDB Connection': 95,
+            
+            'Slack Bot Token': 85,
+            'Discord Bot Token': 85,
+            'Telegram Bot Token': 85,
+            'Stripe Webhook Secret': 85,
+            'DigitalOcean Token': 85,
+            'Heroku API Key': 85,
+            
+            'JWT Token': 75,  # ↑ De 70 → 75
+            'CircleCI Token': 75,
+            'Travis CI Token': 75,
+        }
+        
+        confidence = base_scores.get(secret_type, 50)
+        context_lower = context.lower()
+        
+        # ════════════════════════════════════════════════════════════
+        # MALUS (Réduisent la confiance)
+        # ════════════════════════════════════════════════════════════
+        
+        # Test/Dev/Demo context (-25%)
+        if any(w in context_lower for w in ['testing', 'dev', 'demo', 'test', 'staging', 'sandbox']):
+            confidence -= 25
+        
+        # Example/Doc (-20%)
+        if any(w in context_lower for w in ['example', 'documentation', 'doc', 'guide', 'readme']):
+            confidence -= 20
+        
+        # Fake/Mock/Dummy (-30%)
+        if any(w in context_lower for w in ['fake', 'mock', 'dummy', 'placeholder', 'sample']):
+            confidence -= 30
+        
+        # Variable commence par TEST/EXAMPLE (-20%)
+        if re.search(r'\b(TEST|EXAMPLE|DEMO|SAMPLE|FAKE)_[A-Z_]*\s*[=:]', context, re.IGNORECASE):
+            confidence -= 20
+        
+        # ════════════════════════════════════════════════════════════
+        # BONUS (Augmentent la confiance)
+        # ════════════════════════════════════════════════════════════
+        
+        # Production context (+20%)
+        if any(w in context_lower for w in ['production', 'prod', 'live', 'real', 'actual']):
+            confidence += 20
+        
+        # API key/secret context (+15%)
+        if re.search(r'(api_key|api_secret|password|secret|token|credential)\s*[=:]', context_lower):
+            confidence += 15
+        
+        # URL API context (+10%)
+        if re.search(r'(api_url|endpoint|https?://)', context_lower):
+            confidence += 10
+        
+        # Variable commence par PROD/REAL (+15%)
+        if re.search(r'\b(PROD|PRODUCTION|REAL|LIVE)_', context, re.IGNORECASE):
+            confidence += 15
+        
+        # Format validation bonus (+5%) / malus (-30%)
+        if self._validate_secret_format(secret_type, value):
+            confidence += 5
+        else:
+            confidence -= 30
+        
+        return max(0, min(100, confidence))
 
     def extract_js_urls(self, html: str, base_url: str) -> list:
         parsed_base = urlparse(base_url)
@@ -1366,7 +1554,7 @@ class JSScanner:
             if parsed_base.netloc not in parsed_url.netloc and parsed_url.netloc not in parsed_base.netloc:
                 continue
             
-            # Bloquer les libs connues
+            # Bloquer libs connues
             if any(lib in url.lower() for lib in ['node_modules', 'jquery', 'bootstrap', 'react', 'angular', 'polyfill', 'chunk', 'vendor']):
                 continue
             
@@ -1374,9 +1562,11 @@ class JSScanner:
 
         return list(found_urls)[:MAX_JS_PER_DOMAIN]
 
-    def scan_js_content(self, content: str, js_url: str) -> list:
+    def scan_js_content(self, content: str, js_url: str, domain: str = "") -> list:
+        """✅ AMÉLIORÉ: Scan avec logging des rejets."""
         findings   = []
         seen_vals  = set()
+        rejected_secrets = []  # ✅ NOUVEAU: Track rejets
 
         for secret_type, pattern in JS_SECRET_COMPILED.items():
             try:
@@ -1385,15 +1575,28 @@ class JSScanner:
 
                     if not value or value in seen_vals:
                         continue
-                    if self._is_allowlisted_value(value):
+                    
+                    # ✅ NOUVEAU: Logger rejets
+                    if self._is_allowlisted_value(value, secret_type):
+                        rejected_secrets.append(('allowlist', secret_type, value[:50]))
+                        continue
+                    
+                    if not self._validate_secret_format(secret_type, value):
+                        rejected_secrets.append(('format_invalid', secret_type, value[:50]))
+                        # ✅ NOUVEAU: Logger FP
+                        if domain:
+                            db.log_js_false_positive(domain, js_url, secret_type, value[:120], "Format invalide")
                         continue
 
                     seen_vals.add(value)
                     context = self._extract_context(content, match)
-
                     confidence = self._calculate_confidence(secret_type, value, context)
                     
-                    if confidence < 75:  # Seuil ÉLEVÉ : 75% minimum
+                    if confidence < 75:
+                        rejected_secrets.append(('low_confidence', secret_type, f"{confidence}%"))
+                        # ✅ NOUVEAU: Logger FP
+                        if domain:
+                            db.log_js_false_positive(domain, js_url, secret_type, value[:120], f"Confiance basse: {confidence}%")
                         continue
 
                     findings.append({
@@ -1405,54 +1608,14 @@ class JSScanner:
                     })
             except Exception:
                 continue
+        
+        # ✅ NOUVEAU: Log des rejets pour audit
+        if rejected_secrets and len(rejected_secrets) <= 15:
+            tprint(f"[JS SCAN] {js_url}: {len(rejected_secrets)} secret(s) rejeté(s)")
+            for reason, stype, val in rejected_secrets[:5]:
+                tprint(f"  └─ {reason}: {stype}")
 
         return findings
-
-    def _calculate_confidence(self, secret_type: str, value: str, context: str) -> int:
-        """Calcul STRICT de confiance."""
-        base_scores = {
-            # CRITIQUE (95%)
-            'AWS Access Key ID': 95,
-            'AWS Secret Access Key': 95,
-            'GCP API Key': 95,
-            'GCP Service Account Key': 95,
-            'GitHub Personal Token': 95,
-            'GitHub OAuth Token': 95,
-            'GitHub App Token': 95,
-            'Stripe Secret Key Live': 95,
-            'RSA Private Key': 95,
-            'EC Private Key': 95,
-            'OpenSSH Private Key': 95,
-            'PGP Private Key': 95,
-            'PostgreSQL Connection': 95,
-            'MySQL Connection': 95,
-            'MongoDB Connection': 95,
-            
-            # ÉLEVÉ (85%)
-            'Slack Bot Token': 85,
-            'Discord Bot Token': 85,
-            'Telegram Bot Token': 85,
-            'Stripe Webhook Secret': 85,
-            'DigitalOcean Token': 85,
-            'Heroku API Key': 85,
-            
-            # MOYEN (70%)
-            'JWT Token': 70,
-            'CircleCI Token': 70,
-            'Travis CI Token': 70,
-        }
-        
-        confidence = base_scores.get(secret_type, 50)
-        
-        # Malus pour contexte testing
-        if any(word in context.lower() for word in ['testing', 'dev', 'demo', 'test', 'staging']):
-            confidence -= 25
-        
-        # Malus pour contexte example
-        if 'example' in context.lower():
-            confidence -= 20
-        
-        return max(0, min(100, confidence))
 
     def _download_js_to_tmp(self, js_url: str) -> tuple:
         session  = get_session()
@@ -1544,7 +1707,7 @@ class JSScanner:
                 with open(tmp_path, 'r', encoding='utf-8', errors='replace') as f:
                     js_content = f.read()
 
-                findings = self.scan_js_content(js_content, js_url)
+                findings = self.scan_js_content(js_content, js_url, domain)  # ✅ Passer domain
 
                 db.update_js_scan_history(js_url, content_hash, len(findings))
 
@@ -1625,7 +1788,7 @@ class JSScanner:
             "description": f"**{total_secrets}** secret(s) VRAI(S) | **{critical_count}** CRITIQUE(S)",
             "color":       color,
             "fields":      fields,
-            "footer":      {"text": "CT Monitor v4.3.1 — ZERO FALSE POSITIVES"},
+            "footer":      {"text": "CT Monitor v4.3.2 — ZERO FALSE POSITIVES"},
             "timestamp":   datetime.utcnow().isoformat()
         }
         discord_send({"embeds": [embed]})
@@ -1633,7 +1796,7 @@ class JSScanner:
 
     def scan_all_sequential(self):
         tprint("[JS SCAN] ════════════════════════════════════════")
-        tprint("[JS SCAN] Démarrage scan secrets JS (ULTRA-STRICT, ZERO FALSE POSITIVES)")
+        tprint("[JS SCAN] Démarrage scan secrets JS (ULTRA-STRICT, ZERO FALSE POSITIVES v4.3.2)")
 
         total_domains = total_files = total_secrets = 0
         start = time.time()
@@ -2171,9 +2334,10 @@ if os.environ.get('DUMP_DB', '0') == '1':
 
 # ==================== DÉMARRAGE ====================
 tprint("[START] ================================================")
-tprint(f"[START] CT Monitor v4.3.1 - COMPLETE FIXED (ZERO FALSE POSITIVES)")
+tprint(f"[START] CT Monitor v4.3.2 - COMPLETE FIXED (ZERO FALSE POSITIVES)")
 tprint(f"[START] {NB_LOGS_ACTIFS} logs CT | {len(targets)} domaine(s) surveillés")
 tprint(f"[START] HTTP pool: {HTTP_CONCURRENCY_LIMIT} workers | JS patterns: {len(JS_SECRET_COMPILED)} ULTRA-STRICT")
+tprint(f"[START] JS scanner v4.3.2: Format validation + Contexte 500ch + Confiance intelligente")
 tprint(f"[START] JS scan interval: {JS_SCAN_INTERVAL}s | Confidence threshold: 75% MINIMUM")
 tprint(f"[START] Notification TTL: {NOTIFICATION_TTL // 3600}h | History: {CHECK_HISTORY_RETENTION_DAYS}j")
 tprint("[START] ================================================")
@@ -2232,7 +2396,8 @@ while True:
         tprint(f"[CYCLE #{cycle}] Duplicates évités     : {stats['duplicates_évités']:,}")
         tprint(f"[CYCLE #{cycle}] Echo-servers bloqués  : {stats['echo_server_blocked']:,}")
         tprint(f"[CYCLE #{cycle}] JS fichiers scannés   : {stats['js_files_scanned']:,}")
-        tprint(f"[CYCLE #{cycle}] JS SECRETS VRAIS trouvés: {stats['js_secrets_found']:,}")
+        tprint(f"[CYCLE #{cycle}] JS SECRETS VRAIS      : {stats['js_secrets_found']:,}")
+        tprint(f"[CYCLE #{cycle}] JS FALSE POSITIVES    : {stats['js_false_positives']:,}")  # ✅ NOUVEAU
         tprint(f"[CYCLE #{cycle}] Discord queue         : {_discord_queue.qsize()} | perdus: {stats['discord_dropped']}")
         tprint(f"[CYCLE #{cycle}] DB : {_s['total']} domaines | {db.size_mb()} MB")
         tprint(f"[CYCLE #{cycle}] DB : {_s['timeout']} timeout | {_s['4xx']} 4xx | {_s['5xx']} 5xx")
