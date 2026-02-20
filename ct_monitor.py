@@ -453,15 +453,19 @@ class CertificateDatabase:
         return self._local.conn
 
     def get_conn(self):
-        if not hasattr(self._local, 'rw_conn') or self._local.rw_conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=True, timeout=60)
-            conn.execute('PRAGMA journal_mode=WAL')
-            conn.execute('PRAGMA synchronous=NORMAL')
-            self._local.rw_conn = conn
-        return self._local.rw_conn
+        """
+        ✅ FIX v4.4.4: Crée toujours une connexion fraîche (pas de cache).
+        La connexion doit être fermée par l'appelant après usage.
+        Évite le database is locked causé par des connexions rw qui restent ouvertes.
+        """
+        conn = sqlite3.connect(self.db_path, check_same_thread=True, timeout=30)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA busy_timeout=15000')
+        return conn
 
     def init_db(self):
-        conn   = self.get_conn()
+        conn   = self.get_conn()  # connexion fraîche, fermée à la fin
         cursor = conn.cursor()
         cursor.execute('''CREATE TABLE IF NOT EXISTS subdomains (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -548,6 +552,7 @@ class CertificateDatabase:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_js_url ON js_scan_history(js_url)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_js_fp_domain ON js_false_positives(domain)')
         conn.commit()
+        conn.close()  # ✅ FIX: libère le verrou immédiatement
         tprint(f"[DB] Initialisée: {self.db_path}")
 
     def subdomain_exists(self, domain):
@@ -714,6 +719,7 @@ class CertificateDatabase:
             conn = self.get_conn()
             conn.execute('PRAGMA optimize')
             conn.commit()
+            conn.close()  # ✅ FIX: libère le verrou
             tprint("[DB] PRAGMA optimize exécuté")
         except Exception as e:
             tprint(f"[DB ERROR] vacuum_optimize: {e}")
@@ -2103,7 +2109,7 @@ def monitor_all_logs():
 # ==================== NETTOYAGE DB ====================
 def cleanup_db():
     try:
-        conn   = db.get_conn()
+        conn   = db.get_conn()  # ✅ connexion fraîche
         cursor = conn.cursor()
         cursor.execute("DELETE FROM subdomains WHERE domain LIKE '*.%'")
         wildcards_deleted = cursor.rowcount
@@ -2119,6 +2125,7 @@ def cleanup_db():
         else:
             orphans_deleted = 0
         conn.commit()
+        conn.close()  # ✅ FIX: libère le verrou immédiatement
         if wildcards_deleted > 0:
             tprint(f"[DB CLEANUP] {wildcards_deleted} wildcard(s) supprimé(s)")
         if orphans_deleted > 0:
@@ -2132,7 +2139,7 @@ def cleanup_db():
 def dump_db():
     tprint("[DUMP] Envoi DB sur Discord...")
     try:
-        conn    = db.get_conn()
+        conn    = db.get_conn()  # ✅ connexion fraîche
         cursor  = conn.cursor()
         summary = db.stats_summary()
         requests.post(DISCORD_WEBHOOK, json={"embeds": [{
@@ -2177,6 +2184,7 @@ def dump_db():
             "description": f"{total_sent} domaine(s) envoyés.",
             "color": 0x00ff00, "footer": {"text": "CT Monitor — DUMP_DB"}
         }]}, timeout=10)
+        conn.close()  # ✅ FIX: libère le verrou
         tprint(f"[DUMP] {total_sent} domaine(s) envoyés")
     except Exception as e:
         tprint(f"[DUMP ERROR] {e}")
