@@ -42,7 +42,7 @@ def tprint(msg):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 tprint("=" * 100)
-tprint("CT MONITORING - VERSION v4.4.0 - PARALLEL EDITION")
+tprint("CT MONITORING - VERSION v4.4.1 - PARALLEL EDITION + FP FIXES")
 tprint(f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
 tprint("=" * 100)
 
@@ -396,13 +396,17 @@ class DatabaseWriter:
     def _flush(self, batch: list):
         try:
             cursor = self._conn.cursor()
+            errors_in_batch = 0
             for op in batch:
                 try:
                     cursor.execute(op.sql, op.params)
                 except sqlite3.IntegrityError:
                     pass  # UNIQUE violations attendues (INSERT OR IGNORE)
                 except Exception as e:
-                    tprint(f"[DB WRITER] Erreur op: {e} — SQL: {op.sql[:80]}")
+                    errors_in_batch += 1
+                    # Log seulement 1 fois par batch pour éviter le flood
+                    if errors_in_batch == 1:
+                        tprint(f"[DB WRITER] Erreur op: {e} — SQL: {op.sql[:60]}")
                 finally:
                     if op.result_future:
                         op.result_future.set()
@@ -563,6 +567,23 @@ class CertificateDatabase:
             ''')
             cursor.execute('DROP TABLE unreachable_domains')
             tprint("[DB] Migration unreachable_domains → subdomains effectuée")
+
+        # ── Migration colonnes manquantes (ALTER TABLE idempotent) ───────────
+        # Nécessaire quand la DB a été créée par une version antérieure du script.
+        # SQLite ne supporte pas ALTER TABLE ADD COLUMN IF NOT EXISTS,
+        # donc on inspecte pragma table_info() avant chaque ALTER.
+        def _add_column_if_missing(table: str, column: str, col_def: str):
+            cursor.execute(f'PRAGMA table_info({table})')
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if column not in existing_cols:
+                cursor.execute(f'ALTER TABLE {table} ADD COLUMN {column} {col_def}')
+                tprint(f"[DB MIGRATION] ALTER TABLE {table} ADD COLUMN {column}")
+
+        _add_column_if_missing('js_secrets', 'confidence',  'INTEGER DEFAULT 50')
+        _add_column_if_missing('js_secrets', 'notified',    'BOOLEAN DEFAULT 0')
+        _add_column_if_missing('js_secrets', 'context',     'TEXT')
+        _add_column_if_missing('subdomains', 'log_source',  'TEXT')
+        # ─────────────────────────────────────────────────────────────────────
 
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain ON subdomains(domain)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_check ON subdomains(last_check)')
@@ -1345,6 +1366,9 @@ class PathMonitor:
 path_monitor = PathMonitor(PATHS_FILE)
 
 # ==================== JS SECRET PATTERNS ====================
+# v4.4.1 — Travis CI Token SUPPRIMÉ (trop générique, matchait Base64/WASM/nombres)
+#           Heroku: UUID blocklist ajoutée (CLSIDs publics Adobe/Microsoft/RFC)
+#           CircleCI: pattern renforcé avec contexte obligatoire
 JS_SECRET_PATTERNS_RAW = {
     'AWS Access Key ID':      r'\bAKIA[0-9A-Z]{16}\b',
     'AWS Secret Access Key':  r'\bwsu4ecoCS[A-Za-z0-9/+]{30,40}\b',
@@ -1368,10 +1392,33 @@ JS_SECRET_PATTERNS_RAW = {
     'Discord Bot Token':      r'\b[MN][A-Za-z0-9_\-]{23,25}\.[A-Za-z0-9_\-]{6,8}\.[A-Za-z0-9_\-]{25,38}\b',
     'Telegram Bot Token':     r'\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b',
     'Stripe Webhook Secret':  r'\bwhsec_[A-Za-z0-9_\-]{32,}\b',
+    # Heroku: UUID format MAIS filtré par blocklist dans _is_allowlisted_value
     'Heroku API Key':         r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
     'DigitalOcean Token':     r'\bdop_v1_[a-f0-9]{64}\b',
-    'CircleCI Token':         r'\b[a-f0-9]{40}(?:[a-f0-9]{20})?\b(?![\-])(?<![a-z0-9-])',
-    'Travis CI Token':        r'\b[a-zA-Z0-9_-]{100,}\b',
+    # CircleCI: contexte obligatoire (variable assignment autour)
+    'CircleCI Token':         r'(?:CIRCLE_TOKEN|circleci[_\-]token|circle[_\-]api[_\-]key)\s*[=:]\s*["\']?([a-f0-9]{40})["\']?',
+}
+
+# UUIDs publics connus — jamais des vrais tokens Heroku
+# Sources: Adobe Flash CLSID, Microsoft COM, RFC 4122 exemples, plupload, etc.
+HEROKU_UUID_BLOCKLIST = {
+    # Adobe Flash / Shockwave
+    'd27cdb6e-ae6d-11cf-96b8-444553540000',
+    # RFC 4122 exemples officiels
+    '6ba7b810-9dad-11d1-80b4-00c04fd430c8',
+    '6ba7b811-9dad-11d1-80b4-00c04fd430c8',
+    '6ba7b812-9dad-11d1-80b4-00c04fd430c8',
+    '6ba7b814-9dad-11d1-80b4-00c04fd430c8',
+    # Microsoft COM/OLE
+    'd5cdd505-2e9c-101b-9397-08002b2cf9ae',
+    'c2f41010-65b3-11d1-a29f-00aa00c14882',
+    'f4754c9b-64f5-4b40-8af4-679732ac006f',
+    # UUID nil / max
+    '00000000-0000-0000-0000-000000000000',
+    'ffffffff-ffff-ffff-ffff-ffffffffffff',
+    # Exemples courants dans les tests/libs
+    '110e8400-e29b-41d4-a716-446655440000',
+    '123e4567-e89b-12d3-a456-426614174000',
 }
 
 JS_SECRET_ALLOWLIST_VALUES = {
@@ -1397,7 +1444,7 @@ JS_SECRET_COMPILED = {
     for name, pattern in JS_SECRET_PATTERNS_RAW.items()
 }
 
-tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns ULTRA-STRICT compilés (v4.4.0)")
+tprint(f"[JS SCANNER] {len(JS_SECRET_COMPILED)} patterns compilés (v4.4.1 — Travis CI supprimé, Heroku blocklist, detection Base64)")
 
 # ==================== JS SECRET SCANNER (PARALLÉLISÉ) ====================
 class JSScanner:
@@ -1421,9 +1468,10 @@ class JSScanner:
         'Slack Bot Token':        lambda v: v.startswith('xoxb-') and len(v) > 40,
         'Discord Bot Token':      lambda v: (v.startswith('M') or v.startswith('N')) and '.' in v,
         'Telegram Bot Token':     lambda v: re.match(r'^\d{8,10}:AA[A-Za-z0-9_-]{33}$', v),
-        'Heroku API Key':         lambda v: re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', v),
+        'Heroku API Key':         lambda v: bool(re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', v)),
         'DigitalOcean Token':     lambda v: v.startswith('dop_v1_') and len(v) > 40,
-        'CircleCI Token':         lambda v: len(v) >= 40 and not any(c in v for c in ['-', '.']),
+        # CircleCI: pattern avec groupe capturant, token = 40 hex purs
+        'CircleCI Token':         lambda v: len(v) == 40 and all(c in '0123456789abcdef' for c in v.lower()),
     }
 
     def _validate_secret_format(self, secret_type: str, value: str) -> bool:
@@ -1436,6 +1484,50 @@ class JSScanner:
 
     def _content_hash(self, content: str) -> str:
         return hashlib.sha256(content.encode('utf-8', errors='replace')).hexdigest()[:16]
+
+    # ── Préfixes Base64 connus pour du binaire (PNG, SVG, WASM, PDF, OTF...) ──
+    _BASE64_BINARY_PREFIXES = (
+        'ivborw0kggo',   # PNG  (\x89PNG)
+        'jvber',          # PDF  (%PDF)
+        'phN2zy',         # SVG  (<svg) — lowercase après decode
+        'phn2zy',         # SVG variante
+        'aaec',           # WASM (\x00asm) fréquent
+        'ugaa',           # TTF/OTF
+        'otar',           # OTF
+        'amos',           # WASM asm.js
+        'agmif',          # GIF89a
+        'r0lgodlh',       # GIF
+        't2gg',           # TIFF
+        'ue1a',           # ZIP
+        'pgg=',           # Générique court — trop risqué, skip
+    )
+
+    def _is_base64_binary(self, value: str) -> bool:
+        """Détecte les chaînes Base64 encodant du contenu binaire (PNG, SVG, WASM...)."""
+        v_low = value.lower()
+        # Vérifier les préfixes connus
+        if any(v_low.startswith(p) for p in self._BASE64_BINARY_PREFIXES):
+            return True
+        # Heuristique: Base64 pur avec très peu de '_' et '-' (pas un token)
+        # Un vrai token API a en général des caractères variés et un contexte d'assignation
+        b64_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=')
+        if len(value) > 80 and all(c in b64_chars for c in value):
+            # Tenter un décodage partiel pour détecter les magic bytes
+            try:
+                # Padding
+                padded = value[:64] + '=' * (4 - len(value[:64]) % 4)
+                decoded = base64.b64decode(padded, validate=False)[:6]
+                # Magic bytes: PNG, GIF, PDF, WASM, ZIP, OTF, TTF
+                magic = [
+                    b'\x89PNG', b'GIF8', b'%PDF', b'\x00asm',
+                    b'PK\x03\x04', b'\x00\x01\x00\x00', b'OTTO',
+                    b'<svg', b'<?xm', b'<htm',
+                ]
+                if any(decoded.startswith(m) for m in magic):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _is_allowlisted_value(self, value: str, secret_type: str = None) -> bool:
         v = value.strip().lower()
@@ -1450,6 +1542,9 @@ class JSScanner:
             return True
         if v in JS_SECRET_ALLOWLIST_VALUES:
             return True
+        # ── Heroku: UUID blocklist (CLSIDs publics connus) ──────────────────
+        if secret_type == 'Heroku API Key' and v in HEROKU_UUID_BLOCKLIST:
+            return True
         if '\\u' in value or (value and '\u0000' <= value[0] <= '\u001f'):
             return True
         validation_kw = ['must be', 'password', 'confirm', 'enter', 'invalid', 'required', 'error']
@@ -1463,6 +1558,18 @@ class JSScanner:
             return True
         if '<' in v or '[' in v or '{' in v:
             return True
+        # ── Détecter Base64 binaire (PNG/SVG/WASM/PDF) ──────────────────────
+        if self._is_base64_binary(value):
+            return True
+        # ── Séquences répétitives (ex: 0123425252...  nombres test) ─────────
+        if len(value) > 50:
+            # Entropie faible: moins de 12 chars uniques sur 50+ = pattern répétitif
+            if len(set(value)) < 12:
+                return True
+            # Que des chiffres et quelques chars (séquences numériques de test)
+            digit_ratio = sum(1 for c in value if c.isdigit()) / len(value)
+            if digit_ratio > 0.85 and len(value) > 50:
+                return True
         return False
 
     def _extract_context(self, content: str, match) -> str:
@@ -1482,7 +1589,8 @@ class JSScanner:
             'PostgreSQL Connection': 95, 'MySQL Connection': 95, 'MongoDB Connection': 95,
             'Slack Bot Token': 85, 'Discord Bot Token': 85, 'Telegram Bot Token': 85,
             'Stripe Webhook Secret': 85, 'DigitalOcean Token': 85, 'Heroku API Key': 85,
-            'JWT Token': 75, 'CircleCI Token': 75, 'Travis CI Token': 75,
+            'JWT Token': 75, 'CircleCI Token': 75,
+            # Travis CI Token supprimé en v4.4.1 (trop de faux positifs Base64)
         }
         confidence    = base_scores.get(secret_type, 50)
         context_lower = context.lower()
@@ -1568,9 +1676,8 @@ class JSScanner:
                 continue
 
         if rejected_secrets and len(rejected_secrets) <= 15:
-            tprint(f"[JS SCAN] {js_url}: {len(rejected_secrets)} secret(s) rejeté(s)")
-            for reason, stype, val in rejected_secrets[:5]:
-                tprint(f"  └─ {reason}: {stype}")
+            # Log seulement si peu de rejets (évite le flood Railway)
+            pass  # Silencieux — les stats sont trackées via stats_lock
 
         return findings
 
@@ -1634,7 +1741,8 @@ class JSScanner:
         if not js_urls:
             return all_findings
 
-        tprint(f"[JS SCAN] {domain} → {len(js_urls)} fichier(s) JS")
+        # Log seulement si des fichiers JS trouvés (pas pour chaque domaine)
+        # tprint retiré ici pour éviter le rate limit Railway (500 logs/sec)
 
         for js_url in js_urls:
             tmp_path = None
@@ -1643,12 +1751,9 @@ class JSScanner:
                 if not tmp_path:
                     continue
 
-                size_kb = size_bytes // 1024
-                tprint(f"[JS SCAN] 📥 {js_url.split('/')[-1][:50]} ({size_kb} KB)")
-
+                # ⚠️ tprint retiré (trop verbeux — 1 log/fichier × N domaines × M fichiers)
                 history = db.get_js_scan_history(js_url)
                 if history and history['content_hash'] == content_hash:
-                    tprint(f"[JS SCAN] ⏭️ Inchangé — skip")
                     self._delete_tmp(tmp_path)
                     tmp_path = None
                     with stats_lock:
